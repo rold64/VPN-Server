@@ -832,22 +832,25 @@ ask_dns_servers() {
         fi
     done
 
-    # Get primary DNS IPs
+    # Get DNS IPs — when same provider chosen for both, use its secondary IP for DNS2
     local dns1_pair dns2_pair
     dns1_pair=$(get_dns_ipv4 "$d1")
     dns2_pair=$(get_dns_ipv4 "$d2")
     SETUP_DNS1=$(echo "$dns1_pair" | awk '{print $1}')
-    SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $1}')
-
-    # Handle internal DNS: use server's actual IP for VPN interface
-    if [ "$SETUP_DNS1" = "127.0.0.1" ]; then
-        SETUP_DNS1="127.0.0.1"
+    if [ "$d1" = "$d2" ]; then
+        SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $2}')
+    else
+        SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $1}')
     fi
 
     if [ "$SETUP_IPV6" = "yes" ]; then
         local v6_1 v6_2
         v6_1=$(get_dns_ipv6 "$d1" | awk '{print $1}')
-        v6_2=$(get_dns_ipv6 "$d2" | awk '{print $1}')
+        if [ "$d1" = "$d2" ]; then
+            v6_2=$(get_dns_ipv6 "$d2" | awk '{print $2}')
+        else
+            v6_2=$(get_dns_ipv6 "$d2" | awk '{print $1}')
+        fi
         SETUP_DNS1_V6="$v6_1"
         SETUP_DNS2_V6="$v6_2"
     fi
@@ -3055,8 +3058,9 @@ add_user_menu() {
 
     # Username
     while true; do
-        echo -en "${YELLOW}  ?${NC}  New username: "
+        echo -en "${YELLOW}  ?${NC}  New username (or 0 to cancel): "
         read -r new_username
+        [ "$new_username" = "0" ] && return
         if [ -z "$new_username" ]; then
             print_warning "Username cannot be empty."
         elif in_list "$new_username" "$(get_state "USERS_LIST")"; then
@@ -3282,9 +3286,46 @@ change_dns_menu() {
     print_section "Change VPN DNS Resolver(s)"
     echo -e "  Current: ${BOLD}$(get_state "DNS1")${NC} / ${BOLD}$(get_state "DNS2")${NC}"
     echo ""
+    echo -e "  Select up to two DNS servers for VPN clients."
+    echo -e "  ${DIM}(Enter two numbers separated by space, or one number for both primary/secondary)${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Server's Internal DNS  ${DIM}(127.0.0.1)${NC}"
+    echo -e "  ${BOLD}2)${NC} Cloudflare             ${DIM}(1.1.1.1, 1.0.0.1)${NC}"
+    echo -e "  ${BOLD}3)${NC} AdGuard                ${DIM}(94.140.14.14, 94.140.15.15)${NC}"
+    echo -e "  ${BOLD}4)${NC} Google                 ${DIM}(8.8.8.8, 8.8.4.4)${NC}"
+    echo -e "  ${BOLD}5)${NC} Quad9                  ${DIM}(9.9.9.9, 149.112.112.112)${NC}"
+    echo -e "  ${BOLD}6)${NC} OpenDNS                ${DIM}(208.67.222.222, 208.67.220.220)${NC}"
+    echo -e "  ${BOLD}0)${NC} Back"
+    echo ""
 
-    # Reuse the ask_dns_servers function but update state and configs
-    ask_dns_servers
+    local d1 d2 dns_input
+    while true; do
+        echo -en "${YELLOW}  ?${NC}  Enter choice(s) [e.g. '4' or '4 2']: "
+        read -r dns_input
+        [ "$dns_input" = "0" ] && return
+        d1=$(echo "$dns_input" | awk '{print $1}')
+        d2=$(echo "$dns_input" | awk '{print $2}')
+        [ -z "$d2" ] && d2="$d1"
+        if echo "$d1" | grep -qE '^[1-6]$' && echo "$d2" | grep -qE '^[1-6]$'; then
+            break
+        fi
+        print_warning "Please enter valid choices (1-6) or 0 to go back."
+    done
+
+    local dns1_pair dns2_pair
+    dns1_pair=$(get_dns_ipv4 "$d1")
+    dns2_pair=$(get_dns_ipv4 "$d2")
+    SETUP_DNS1=$(echo "$dns1_pair" | awk '{print $1}')
+    if [ "$d1" = "$d2" ]; then
+        SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $2}')
+    else
+        SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $1}')
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}Primary DNS:${NC}   $(get_dns_name "$d1") — ${SETUP_DNS1}"
+    echo -e "  ${GREEN}Secondary DNS:${NC} $(get_dns_name "$d2") — ${SETUP_DNS2}"
+    echo ""
 
     save_state "DNS1" "$SETUP_DNS1"
     save_state "DNS2" "$SETUP_DNS2"
