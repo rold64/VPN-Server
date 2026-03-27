@@ -83,6 +83,62 @@ After answering, the script runs fully automatically — no further interaction 
 ---
 
 <details>
+<summary><strong>🔄 Management Menu (Re-run)</strong></summary>
+<br>
+
+Running the script again after installation detects the existing setup and shows a management interface:
+
+```
+VPN Server Management
+─────────────────────────────────────────
+Server    : vpn.example.com (dns)
+VPNs      : ikev2,l2tp,wireguard,openvpn
+IPv6      : yes
+DNS       : 1.1.1.1 / 8.8.8.8
+Users     : 3
+Profiles  : /etc/VPN User Profiles
+
+Management Options:
+
+  1) Add / Remove VPN user(s)
+  2) Change Server DNS name / IP
+  3) Change VPN DNS resolver(s)
+  4) Update VPN servers
+  5) Uninstall VPN server(s)
+  6) Advanced
+  0) Exit
+```
+
+### Option details
+
+**1 — Add / Remove users**
+- Add a new user: prompts for username, password, PSK → creates credentials across all installed VPNs + generates all profile files
+- Remove a user: lists all users, removes credentials from all VPN configs, deletes profile directory and certificates
+- List users: shows all users with their VPN IPs and profile file counts
+
+**2 — Change server address**
+- Switch between DNS hostname and IP address
+- Automatically regenerates the server certificate with the new address/SAN
+- Copies updated certs to strongSwan and OpenVPN
+
+**3 — Change DNS resolvers**
+- Live-updates: xl2tpd PPP options, OpenVPN server config, IKEv2 `rightdns`
+- All affected services are restarted automatically
+
+**4 — Update VPN servers**
+- Runs the system package manager to update strongSwan, xl2tpd, wireguard-tools, and openvpn
+- Restarts all updated services
+
+**5 — Uninstall**
+- Select individual VPN servers or all at once
+- Stops services, removes packages, cleans up config files and firewall rules
+- Updates the state file so re-running the script shows the correct installed state
+
+</details>
+
+---
+
+<details>
 <summary><strong>🔒 VPN Protocols — Authentication & Details</strong></summary>
 <br>
 
@@ -275,62 +331,6 @@ During setup (and later via the management menu), you can push up to **two DNS s
 Enter one number for the same provider as both primary/secondary, or two numbers (e.g. `4 2`) for different providers.
 
 > When IPv6 is enabled, the corresponding IPv6 DNS addresses are automatically configured alongside the IPv4 ones.
-
-</details>
-
----
-
-<details>
-<summary><strong>🔄 Management Menu (Re-run)</strong></summary>
-<br>
-
-Running the script again after installation detects the existing setup and shows a management interface:
-
-```
-VPN Server Management
-─────────────────────────────────────────
-Server    : vpn.example.com (dns)
-VPNs      : ikev2,l2tp,wireguard,openvpn
-IPv6      : yes
-DNS       : 1.1.1.1 / 8.8.8.8
-Users     : 3
-Profiles  : /etc/VPN User Profiles
-
-Management Options:
-
-  1) Add / Remove VPN user(s)
-  2) Change Server DNS name / IP
-  3) Change VPN DNS resolver(s)
-  4) Update VPN servers
-  5) Uninstall VPN server(s)
-  6) Advanced
-  0) Exit
-```
-
-### Option details
-
-**1 — Add / Remove users**
-- Add a new user: prompts for username, password, PSK → creates credentials across all installed VPNs + generates all profile files
-- Remove a user: lists all users, removes credentials from all VPN configs, deletes profile directory and certificates
-- List users: shows all users with their VPN IPs and profile file counts
-
-**2 — Change server address**
-- Switch between DNS hostname and IP address
-- Automatically regenerates the server certificate with the new address/SAN
-- Copies updated certs to strongSwan and OpenVPN
-
-**3 — Change DNS resolvers**
-- Live-updates: xl2tpd PPP options, OpenVPN server config, IKEv2 `rightdns`
-- All affected services are restarted automatically
-
-**4 — Update VPN servers**
-- Runs the system package manager to update strongSwan, xl2tpd, wireguard-tools, and openvpn
-- Restarts all updated services
-
-**5 — Uninstall**
-- Select individual VPN servers or all at once
-- Stops services, removes packages, cleans up config files and firewall rules
-- Updates the state file so re-running the script shows the correct installed state
 
 </details>
 
