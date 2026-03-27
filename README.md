@@ -589,10 +589,15 @@ If you need to re-generate profile files (e.g. after changing the server address
 
 | Issue | Likely cause | Fix |
 |-------|-------------|-----|
-| IKEv2 fails on iOS | Certificate SAN mismatch | Ensure server address matches the CN/SAN in `server.crt` |
+| IKEv2 `AUTH_FAILED`, no EAP prompt | Certificate SAN mismatch or `leftid` type mismatch | Ensure server address matches the CN/SAN in `server.crt`; if server uses an IP, leftid must be the bare IP (no `@` prefix) |
+| IKEv2 `AUTH_FAILED` after cert regeneration | `ipsec reload` does not reload private keys | Run `ipsec restart` (not just `ipsec reload`) after regenerating the server key |
+| iOS "Profile Installation Failed — Certificates invalid" | Empty `PayloadCertificateUUID` in mobileconfig | Regenerate profiles with the latest script version |
+| iOS installs mobileconfig but CA not trusted | CA cert encoded as PEM instead of DER in profile | Regenerate profiles with the latest script version |
+| OpenVPN connects then immediately drops (iOS/macOS) | `lz4-v2` compression not supported by OpenVPN 3 engine | Regenerate `server.conf` and `.ovpn` profile with latest script (uses `allow-compression no`) |
+| OpenVPN "user authentication failed" | Auth directory not readable by `nobody:nogroup` | Check `ls -la /etc/openvpn/auth/` — dir must be `750 root:nogroup`, passwd file `640 root:nogroup` |
+| OpenVPN `VERIFY KU ERROR` | Client cert missing `keyUsage: digitalSignature` | Regenerate user with latest script (use **Update user** to regenerate cert) |
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
-| OpenVPN auth failed | Wrong password hash | Use **Update user** to reset the password and regenerate the hash |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
 
 </details>
