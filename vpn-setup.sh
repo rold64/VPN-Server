@@ -1228,10 +1228,13 @@ generate_client_cert() {
         2>/dev/null || { print_error "Failed to generate client CSR."; exit 1; }
 
     # Write extensions file (extfile approach for OpenSSL 3.x compatibility)
-    cat > "$client_ext" << 'EXT_EOF'
+    # SAN email identity must match LocalIdentifier used in the IKEv2 cert mobileconfig
+    # so strongSwan can verify the client cert identity against the presented IDi.
+    cat > "$client_ext" << EXT_EOF
 [v3_client]
 keyUsage = critical,digitalSignature
 extendedKeyUsage = clientAuth
+subjectAltName = email:${username}@cert.vpn
 EXT_EOF
 
     # Sign with CA
