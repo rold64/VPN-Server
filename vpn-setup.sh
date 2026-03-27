@@ -1201,6 +1201,7 @@ generate_client_cert() {
     local client_p12="${user_dir}/client.p12"
     local ca_key="${CERTS_DIR}/ca.key"
     local ca_crt="${CERTS_DIR}/ca.crt"
+    local client_ext="${user_dir}/client.ext"
 
     # Generate client private key
     openssl genrsa -out "$client_key" 2048 2>/dev/null || {
@@ -1216,6 +1217,12 @@ generate_client_cert() {
         -subj "/C=US/ST=VPN/L=VPN/O=VPN Client/CN=${username}" \
         2>/dev/null || { print_error "Failed to generate client CSR."; exit 1; }
 
+    # Write extensions file (extfile approach for OpenSSL 3.x compatibility)
+    cat > "$client_ext" << 'EXT_EOF'
+[v3_client]
+extendedKeyUsage = clientAuth
+EXT_EOF
+
     # Sign with CA
     openssl x509 -req \
         -in "$client_csr" \
@@ -1225,8 +1232,11 @@ generate_client_cert() {
         -out "$client_crt" \
         -days "${CERT_DAYS}" \
         -sha256 \
-        -addext "extendedKeyUsage=clientAuth" \
+        -extfile "$client_ext" \
+        -extensions v3_client \
         2>/dev/null || { print_error "Failed to sign client certificate."; exit 1; }
+
+    rm -f "$client_ext"
 
     # Export as PKCS#12 (password = user's VPN password)
     openssl pkcs12 -export \
