@@ -18,6 +18,7 @@ STATE_DIR="/etc/vpn-setup"
 STATE_FILE="${STATE_DIR}/state.conf"
 CERTS_DIR="${STATE_DIR}/certs"
 PROFILES_BASE="/etc/VPN User Profiles"
+OPENVPN_DIR="/etc/openvpn"
 
 # VPN IP Ranges
 IKEV2_SERVER_IP="10.10.10.1"
@@ -1539,7 +1540,7 @@ configure_l2tp() {
     mkdir -p /etc/xl2tpd
 
     cat > /etc/xl2tpd/xl2tpd.conf << L2TP_CONF
-# /etc/xl2tpd/xl2tpd.conf - Managed by vpn-setup.sh
+; /etc/xl2tpd/xl2tpd.conf - Managed by vpn-setup.sh
 [global]
 ipsec saref = no
 saref refinfo = 30
@@ -1737,10 +1738,7 @@ install_wireguard() {
 
     # Enable and start WireGuard
     service_enable "wg-quick@wg0"
-    if ! wg-quick up wg0 2>/dev/null; then
-        print_warning "wg-quick up had issues. Trying systemctl..."
-        service_start "wg-quick@wg0"
-    fi
+    service_start "wg-quick@wg0"
 
     mark_vpn_installed "$VPN_WG"
     print_success "WireGuard installed and running (Server PubKey: ${wg_server_pubkey})"
@@ -1995,8 +1993,8 @@ server-ipv6 fddd:2c4:2c4::/48
 push \"route-ipv6 2000::/3\""
     fi
 
-    cat > "${OPENVPN_DIR}/server/server.conf" << OVPN_CONF
-# /etc/openvpn/server/server.conf
+    cat > "${OPENVPN_DIR}/server.conf" << OVPN_CONF
+# /etc/openvpn/server.conf
 # Managed by vpn-setup.sh — DO NOT EDIT MANUALLY
 
 # Network
@@ -2050,7 +2048,7 @@ OVPN_CONF
 
     # nogroup may be nobody on RHEL
     if is_rhel_based; then
-        sed -i 's/^group nogroup$/group nobody/' "${OPENVPN_DIR}/server/server.conf"
+        sed -i 's/^group nogroup$/group nobody/' "${OPENVPN_DIR}/server.conf"
     fi
 
     print_success "OpenVPN server config written."
@@ -2148,8 +2146,8 @@ add_openvpn_user() {
     echo "ifconfig-push ${client_ip} ${OVPN_SERVER_IP}" > "${OPENVPN_DIR}/ccd/${username}"
 
     # Add ccd directive to server config if not already there
-    if ! grep -q "^client-config-dir" "${OPENVPN_DIR}/server/server.conf" 2>/dev/null; then
-        echo "client-config-dir ${OPENVPN_DIR}/ccd" >> "${OPENVPN_DIR}/server/server.conf"
+    if ! grep -q "^client-config-dir" "${OPENVPN_DIR}/server.conf" 2>/dev/null; then
+        echo "client-config-dir ${OPENVPN_DIR}/ccd" >> "${OPENVPN_DIR}/server.conf"
     fi
 
     service_restart "openvpn@server"
@@ -3307,8 +3305,8 @@ change_dns_menu() {
     fi
 
     # Update OpenVPN
-    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server/server.conf" ]; then
-        sed -i "s|^push \"dhcp-option DNS .*|push \"dhcp-option DNS ${SETUP_DNS1}\"|" "${OPENVPN_DIR}/server/server.conf"
+    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
+        sed -i "s|^push \"dhcp-option DNS .*|push \"dhcp-option DNS ${SETUP_DNS1}\"|" "${OPENVPN_DIR}/server.conf"
         service_restart "openvpn@server"
     fi
 
@@ -3601,13 +3599,13 @@ apply_split_tunneling() {
     fi
 
     # OpenVPN: update push directives
-    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server/server.conf" ]; then
+    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
         # Remove existing redirect-gateway and route push lines
-        sed -i '/^push "redirect-gateway/d' "${OPENVPN_DIR}/server/server.conf"
-        sed -i '/^push "route /d' "${OPENVPN_DIR}/server/server.conf"
+        sed -i '/^push "redirect-gateway/d' "${OPENVPN_DIR}/server.conf"
+        sed -i '/^push "route /d' "${OPENVPN_DIR}/server.conf"
 
         if [ "$mode" = "full" ]; then
-            echo 'push "redirect-gateway def1 bypass-dhcp"' >> "${OPENVPN_DIR}/server/server.conf"
+            echo 'push "redirect-gateway def1 bypass-dhcp"' >> "${OPENVPN_DIR}/server.conf"
         else
             # Add individual subnet routes
             echo "$subnets" | tr ',' '\n' | while read -r subnet; do
@@ -3615,7 +3613,7 @@ apply_split_tunneling() {
                 local net mask
                 net=$(echo "$subnet" | cut -d/ -f1)
                 mask=$(cidr_to_mask "$(echo "$subnet" | cut -d/ -f2)")
-                echo "push \"route ${net} ${mask}\"" >> "${OPENVPN_DIR}/server/server.conf"
+                echo "push \"route ${net} ${mask}\"" >> "${OPENVPN_DIR}/server.conf"
             done
         fi
         service_restart "openvpn@server"
@@ -4030,9 +4028,9 @@ IPV6_SYSCTL
     fi
 
     # Remove IPv6 from OpenVPN
-    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server/server.conf" ]; then
-        sed -i '/server-ipv6/d' "${OPENVPN_DIR}/server/server.conf"
-        sed -i '/route-ipv6/d' "${OPENVPN_DIR}/server/server.conf"
+    if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
+        sed -i '/server-ipv6/d' "${OPENVPN_DIR}/server.conf"
+        sed -i '/route-ipv6/d' "${OPENVPN_DIR}/server.conf"
         service_restart "openvpn@server"
     fi
 
