@@ -111,10 +111,59 @@ Management Options:
 
 ### Option details
 
-**1 — Add / Remove users**
-- Add a new user: prompts for username, password, PSK → creates credentials across all installed VPNs + generates all profile files
-- Remove a user: lists all users, removes credentials from all VPN configs, deletes profile directory and certificates
-- List users: shows all users with their VPN IPs and profile file counts
+**1 — Add / Remove / Update users**
+
+```
+User Management
+  1) Add a user
+  2) Add multiple users
+  3) Remove a user
+  4) Update user(s)
+  5) Export user list
+  6) List users and profile paths
+  0) Back
+```
+
+**Add a user** — prompts for username, password, and PSK → creates credentials across all installed VPNs and generates all profile files.
+
+**Add multiple users** — two modes:
+
+| Mode | How it works |
+|------|-------------|
+| Interactive | Add users one by one in a loop; enter `0` at the username prompt or answer `N` to stop |
+| Import from CSV | Provide a path to a file with `username,password,psk` per line; all rows are validated first (duplicates, existing users, invalid names, empty fields) before any are created |
+
+CSV format for batch import:
+```
+# username,password,psk
+alice,SecurePass1!,SharedKey123
+bob,SecurePass2!,SharedKey456
+```
+
+**Remove a user** — lists all users, prompts for confirmation, then removes credentials from all VPN configs and deletes the profile directory and certificates.
+
+**Update user(s)** — two modes:
+
+| Mode | How it works |
+|------|-------------|
+| Single user | Select from numbered list → enter new password and/or new PSK (press Enter to keep current); at least one must change |
+| Bulk update from CSV | Provide a path to a file with `username,new_password,new_psk` per line; password or PSK columns may be blank individually (but not both) |
+
+CSV format for bulk update:
+```
+# username,new_password,new_psk   (leave blank to skip that field)
+alice,NewPass1!,
+bob,NewPass2!,NewPSK99
+charlie,,NewPSK88
+```
+
+Updating a password regenerates the client certificate, P12 bundle, and all profile files, and reloads affected services automatically.
+
+> **PSK note:** The L2TP pre-shared key is server-wide. Updating it regenerates connection info for all users and requires existing L2TP clients to reconnect with the new PSK.
+
+**Export user list** — writes a CSV template to `/etc/VPN User Profiles/users_export.csv` with all current usernames. Passwords are not stored — fill them in and use "Import from CSV" to re-provision or migrate users.
+
+**List users** — shows all users with their assigned WireGuard and OpenVPN IPs and profile file counts.
 
 **2 — Change server address**
 - Switch between DNS hostname and IP address
@@ -524,16 +573,17 @@ sudo wg show
 sudo cat /var/log/openvpn-status.log
 ```
 
-### Reset a user's password
+### Change a user's password or PSK
 
-The script doesn't have a dedicated "change password" command. To reset:
 1. Run `sudo bash vpn-setup.sh`
-2. Choose **1 → Remove user**
-3. Run again, choose **1 → Add user** with the new password
+2. Choose **1 → User Management → 4 → Update user(s) → 1 → Update a single user**
+3. Select the user, enter the new password and/or PSK (press Enter to keep the current value)
+
+The script updates all credential stores, regenerates the client certificate and P12, regenerates all profile files, and reloads affected services automatically.
 
 ### Regenerate profile files
 
-If you need to re-generate profile files (e.g. after changing the server address), remove the user and re-add them. The CA and server certificate are preserved — only user certs are regenerated.
+If you need to re-generate profile files (e.g. after changing the server address), use the Update user option with the same credentials — or remove and re-add the user. The CA and server certificate are preserved — only user certs are regenerated.
 
 ### Common issues
 
@@ -542,7 +592,7 @@ If you need to re-generate profile files (e.g. after changing the server address
 | IKEv2 fails on iOS | Certificate SAN mismatch | Ensure server address matches the CN/SAN in `server.crt` |
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
-| OpenVPN auth failed | Wrong password hash | Remove and re-add the user to regenerate the hash |
+| OpenVPN auth failed | Wrong password hash | Use **Update user** to reset the password and regenerate the hash |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
 
 </details>
@@ -612,7 +662,7 @@ The script installs only what is needed for the VPN types you select:
 <summary><strong>🏗️ Script Architecture</strong></summary>
 <br>
 
-The script is organized into logical sections within a single `vpn-setup.sh` file (~4,200 lines):
+The script is organized into logical sections within a single `vpn-setup.sh` file (~4,800 lines):
 
 ```
 vpn-setup.sh
@@ -651,6 +701,12 @@ vpn-setup.sh
 │   └── Plain-text connection info
 ├── Management menu (re-run detection)
 │   ├── User management
+│   │   ├── Add single user
+│   │   ├── Batch add (interactive loop / CSV import)
+│   │   ├── Remove user
+│   │   ├── Update user(s) (single / bulk CSV)
+│   │   ├── Export user list (CSV template)
+│   │   └── List users with IPs and profile counts
 │   ├── Server address change
 │   ├── DNS change
 │   ├── Update / Uninstall
