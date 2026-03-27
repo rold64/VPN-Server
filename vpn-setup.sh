@@ -3035,8 +3035,11 @@ manage_users_menu() {
         fi
         echo ""
         echo -e "  ${BOLD}1)${NC} Add a user"
-        echo -e "  ${BOLD}2)${NC} Remove a user"
-        echo -e "  ${BOLD}3)${NC} List users and profile paths"
+        echo -e "  ${BOLD}2)${NC} Add multiple users"
+        echo -e "  ${BOLD}3)${NC} Remove a user"
+        echo -e "  ${BOLD}4)${NC} Update user(s)"
+        echo -e "  ${BOLD}5)${NC} Export user list"
+        echo -e "  ${BOLD}6)${NC} List users and profile paths"
         echo -e "  ${BOLD}0)${NC} Back"
         echo ""
         echo -en "${YELLOW}  ?${NC}  Enter choice: "
@@ -3044,8 +3047,11 @@ manage_users_menu() {
 
         case "$u_choice" in
             1) add_user_menu ;;
-            2) remove_user_menu ;;
-            3) list_users_detail ;;
+            2) batch_add_users_menu ;;
+            3) remove_user_menu ;;
+            4) update_users_menu ;;
+            5) export_user_list ;;
+            6) list_users_detail ;;
             0) return ;;
             *) print_warning "Invalid choice." ;;
         esac
@@ -3105,6 +3111,546 @@ add_user_menu() {
     done
 
     create_vpn_user "$new_username" "$new_password" "$new_psk"
+    press_enter
+}
+
+#------------------------------------------------------------------------------
+# BATCH ADD USERS
+#------------------------------------------------------------------------------
+
+batch_add_users_menu() {
+    while true; do
+        print_section "Add Multiple Users"
+        echo -e "  ${BOLD}1)${NC} Interactive  — add users one by one"
+        echo -e "  ${BOLD}2)${NC} Import from CSV file"
+        echo -e "  ${BOLD}0)${NC} Back"
+        echo ""
+        echo -en "${YELLOW}  ?${NC}  Enter choice: "
+        read -r choice
+        case "$choice" in
+            1) batch_add_interactive ;;
+            2) batch_add_from_csv ;;
+            0) return ;;
+            *) print_warning "Invalid choice." ;;
+        esac
+    done
+}
+
+batch_add_interactive() {
+    print_section "Batch Add Users — Interactive"
+    local total_created=0
+
+    while true; do
+        local new_username new_password new_psk confirm_pass confirm_psk
+
+        # Username
+        while true; do
+            echo -en "${YELLOW}  ?${NC}  New username (or 0 to stop): "
+            read -r new_username
+            [ "$new_username" = "0" ] && break 2
+            if [ -z "$new_username" ]; then
+                print_warning "Username cannot be empty."
+            elif ! echo "$new_username" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+                print_warning "Username may only contain letters, digits, underscores, hyphens."
+            elif in_list "$new_username" "$(get_state "USERS_LIST")"; then
+                print_warning "User '${new_username}' already exists."
+            else
+                break
+            fi
+        done
+
+        # Password
+        while true; do
+            echo -en "${YELLOW}  ?${NC}  Password (hidden): "
+            read -rs new_password
+            echo ""
+            echo -en "${YELLOW}  ?${NC}  Confirm password: "
+            read -rs confirm_pass
+            echo ""
+            if [ -z "$new_password" ]; then
+                print_warning "Password cannot be empty."
+            elif [ "$new_password" != "$confirm_pass" ]; then
+                print_warning "Passwords do not match."
+            else
+                break
+            fi
+        done
+
+        # PSK
+        while true; do
+            echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden): "
+            read -rs new_psk
+            echo ""
+            echo -en "${YELLOW}  ?${NC}  Confirm PSK: "
+            read -rs confirm_psk
+            echo ""
+            if [ -z "$new_psk" ]; then
+                print_warning "PSK cannot be empty."
+            elif [ "$new_psk" != "$confirm_psk" ]; then
+                print_warning "PSKs do not match."
+            else
+                break
+            fi
+        done
+
+        create_vpn_user "$new_username" "$new_password" "$new_psk"
+        ((total_created++))
+
+        echo ""
+        if ! ask_yn "  Add another user?" "n"; then
+            break
+        fi
+        echo ""
+    done
+
+    echo ""
+    print_info "Batch add complete: ${total_created} user(s) created."
+    press_enter
+}
+
+batch_add_from_csv() {
+    print_section "Batch Add Users — CSV Import"
+    echo -e "  CSV format: ${BOLD}username,password,psk${NC}  (# lines and blank lines are skipped)"
+    echo ""
+    echo -en "${YELLOW}  ?${NC}  Path to CSV file (or 0 to cancel): "
+    read -r csv_path
+    [ "$csv_path" = "0" ] && return
+
+    if [ ! -f "$csv_path" ]; then
+        print_error "File not found: ${csv_path}"
+        press_enter
+        return
+    fi
+
+    # Phase 1 — validate all lines
+    local line_num=0
+    local error_count=0
+    local valid_users=()
+    local valid_passes=()
+    local valid_psks=()
+    local seen_in_file=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        ((line_num++))
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+        local csv_user csv_pass csv_psk
+        csv_user=$(echo "$line" | cut -d',' -f1)
+        csv_pass=$(echo "$line" | cut -d',' -f2)
+        csv_psk=$(echo "$line"  | cut -d',' -f3)
+
+        local row_ok=true
+
+        if [ -z "$csv_user" ] || ! echo "$csv_user" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+            print_warning "Line ${line_num}: invalid username '${csv_user}'"
+            row_ok=false
+        elif in_list "$csv_user" "$(get_state "USERS_LIST")"; then
+            print_warning "Line ${line_num}: user '${csv_user}' already exists"
+            row_ok=false
+        elif in_list "$csv_user" "$seen_in_file"; then
+            print_warning "Line ${line_num}: duplicate username '${csv_user}' in file"
+            row_ok=false
+        fi
+
+        if [ -z "$csv_pass" ]; then
+            print_warning "Line ${line_num}: password is empty"
+            row_ok=false
+        fi
+
+        if [ -z "$csv_psk" ]; then
+            print_warning "Line ${line_num}: PSK is empty"
+            row_ok=false
+        fi
+
+        if $row_ok; then
+            valid_users+=("$csv_user")
+            valid_passes+=("$csv_pass")
+            valid_psks+=("$csv_psk")
+            seen_in_file=$(add_to_list "$csv_user" "$seen_in_file")
+        else
+            ((error_count++))
+        fi
+    done < "$csv_path"
+
+    local valid_count="${#valid_users[@]}"
+    echo ""
+    echo -e "  Valid entries  : ${GREEN}${valid_count}${NC}"
+    echo -e "  Invalid entries: ${RED}${error_count}${NC}"
+
+    if [ "$valid_count" -eq 0 ]; then
+        print_warning "No valid entries to import."
+        press_enter
+        return
+    fi
+
+    # Phase 2 — confirm
+    if [ "$error_count" -gt 0 ]; then
+        echo ""
+        if ! ask_yn "  Proceed with ${valid_count} valid entries (skip invalid)?" "n"; then
+            print_info "Cancelled."
+            press_enter
+            return
+        fi
+    else
+        if ! ask_yn "  Create ${valid_count} user(s)?" "y"; then
+            print_info "Cancelled."
+            press_enter
+            return
+        fi
+    fi
+
+    # Phase 3 — create
+    local created=0 failed=0
+    local i
+    for i in "${!valid_users[@]}"; do
+        if create_vpn_user "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}"; then
+            ((created++))
+        else
+            print_error "Failed to create user '${valid_users[$i]}'"
+            ((failed++))
+        fi
+    done
+
+    echo ""
+    print_info "Import complete: ${created} created, ${failed} failed."
+    press_enter
+}
+
+#------------------------------------------------------------------------------
+# UPDATE USERS
+#------------------------------------------------------------------------------
+
+update_users_menu() {
+    while true; do
+        print_section "Update User(s)"
+        echo -e "  ${BOLD}1)${NC} Update a single user"
+        echo -e "  ${BOLD}2)${NC} Bulk update from CSV"
+        echo -e "  ${BOLD}0)${NC} Back"
+        echo ""
+        echo -en "${YELLOW}  ?${NC}  Enter choice: "
+        read -r choice
+        case "$choice" in
+            1) update_single_user ;;
+            2) batch_update_from_csv ;;
+            0) return ;;
+            *) print_warning "Invalid choice." ;;
+        esac
+    done
+}
+
+update_single_user() {
+    print_section "Update Single User"
+    local users
+    users=$(get_users_list)
+
+    if [ -z "$users" ]; then
+        print_warning "No users configured."
+        press_enter
+        return
+    fi
+
+    echo -e "  Select user to update:"
+    echo ""
+    local i=1
+    local user_array=()
+    while IFS= read -r u; do
+        echo -e "  ${BOLD}${i})${NC} $u"
+        user_array+=("$u")
+        ((i++))
+    done <<< "$users"
+    echo -e "  ${BOLD}0)${NC} Cancel"
+    echo ""
+
+    local sel
+    while true; do
+        echo -en "${YELLOW}  ?${NC}  Enter number: "
+        read -r sel
+        [ "$sel" = "0" ] && return
+        if [ "$sel" -ge 1 ] && [ "$sel" -lt "$i" ] 2>/dev/null; then
+            break
+        fi
+        print_warning "Invalid selection."
+    done
+
+    local target_user="${user_array[$((sel-1))]}"
+    echo ""
+    print_info "Updating user: ${target_user}"
+    echo -e "  ${DIM}(press Enter to keep current value)${NC}"
+    echo ""
+
+    # New password
+    local new_password="" confirm_pass
+    while true; do
+        echo -en "${YELLOW}  ?${NC}  New password (hidden, Enter to skip): "
+        read -rs new_password
+        echo ""
+        if [ -z "$new_password" ]; then
+            break
+        fi
+        echo -en "${YELLOW}  ?${NC}  Confirm new password: "
+        read -rs confirm_pass
+        echo ""
+        if [ "$new_password" = "$confirm_pass" ]; then
+            break
+        fi
+        print_warning "Passwords do not match."
+        new_password=""
+    done
+
+    # New PSK
+    local new_psk="" confirm_psk
+    while true; do
+        echo -en "${YELLOW}  ?${NC}  New PSK (hidden, Enter to skip): "
+        read -rs new_psk
+        echo ""
+        if [ -z "$new_psk" ]; then
+            break
+        fi
+        echo -en "${YELLOW}  ?${NC}  Confirm new PSK: "
+        read -rs confirm_psk
+        echo ""
+        if [ "$new_psk" = "$confirm_psk" ]; then
+            break
+        fi
+        print_warning "PSKs do not match."
+        new_psk=""
+    done
+
+    if [ -z "$new_password" ] && [ -z "$new_psk" ]; then
+        print_warning "No changes specified. Nothing to update."
+        press_enter
+        return
+    fi
+
+    update_user_credentials "$target_user" "$new_password" "$new_psk"
+    press_enter
+}
+
+update_user_credentials() {
+    local username="$1"
+    local new_password="$2"
+    local new_psk="$3"
+
+    print_section "Updating credentials for: ${username}"
+
+    local current_psk
+    current_psk=$(get_state "L2TP_PSK")
+    local effective_psk="${new_psk:-$current_psk}"
+
+    # ---- Password update ----
+    if [ -n "$new_password" ]; then
+        print_step "Updating password..."
+
+        # IKEv2 EAP in ipsec.secrets
+        if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.secrets ]; then
+            local escaped_user escaped_pass
+            escaped_user=$(escape_ipsec "$username")
+            escaped_pass=$(escape_ipsec "$new_password")
+            sed -i "s|^${escaped_user} : EAP .*|${escaped_user} : EAP \"${escaped_pass}\"|" /etc/ipsec.secrets
+        fi
+
+        # L2TP PPP in chap-secrets
+        if vpn_is_installed "$VPN_L2TP" && [ -f /etc/ppp/chap-secrets ]; then
+            local ppp_user ppp_pass
+            ppp_user=$(escape_ppp "$username")
+            ppp_pass=$(escape_ppp "$new_password")
+            sed -i "s|^\"${ppp_user}\" l2tpd .*|\"${ppp_user}\" l2tpd \"${ppp_pass}\" *|" /etc/ppp/chap-secrets
+        fi
+
+        # OpenVPN SHA-256 hash in users.passwd
+        if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/auth/users.passwd" ]; then
+            local new_hash
+            new_hash=$(hash_password "$new_password")
+            sed -i "s|^${username}:.*|${username}:${new_hash}|" "${OPENVPN_DIR}/auth/users.passwd"
+        fi
+
+        # Regenerate client cert (P12 export password = VPN password)
+        generate_client_cert "$username" "$new_password"
+
+        # Regenerate all profile files
+        generate_all_profiles "$username" "$new_password" "$effective_psk"
+
+        # Reload services
+        if vpn_is_installed "$VPN_IKEV2"; then
+            ipsec reload 2>/dev/null || true
+        fi
+        if vpn_is_installed "$VPN_L2TP"; then
+            service_restart xl2tpd
+        fi
+        if vpn_is_installed "$VPN_OVPN"; then
+            service_restart openvpn@server
+        fi
+
+        print_success "Password updated."
+    fi
+
+    # ---- PSK update ----
+    if [ -n "$new_psk" ]; then
+        print_step "Updating PSK..."
+
+        save_state "L2TP_PSK" "$new_psk"
+
+        # Update ipsec.secrets PSK line if IKEv2 is installed
+        if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.secrets ]; then
+            local escaped_psk
+            escaped_psk=$(escape_ipsec "$new_psk")
+            sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
+        fi
+
+        # Update xl2tpd/ipsec L2TP PSK if L2TP installed
+        if vpn_is_installed "$VPN_L2TP" && [ -f /etc/ipsec.secrets ]; then
+            local escaped_psk
+            escaped_psk=$(escape_ipsec "$new_psk")
+            sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
+        fi
+
+        print_warning "L2TP PSK is server-wide — all existing L2TP clients need updated profiles."
+
+        # Regenerate profiles for all users to pick up new PSK in connection_info.txt
+        local all_users
+        all_users=$(get_users_list)
+        if [ -n "$all_users" ]; then
+            while IFS= read -r u; do
+                generate_all_profiles "$u" "" "$new_psk"
+            done <<< "$all_users"
+        fi
+
+        if vpn_is_installed "$VPN_IKEV2"; then
+            ipsec reload 2>/dev/null || true
+        fi
+
+        print_success "PSK updated."
+    fi
+
+    print_success "Done updating '${username}'."
+}
+
+batch_update_from_csv() {
+    print_section "Bulk Update from CSV"
+    echo -e "  CSV format: ${BOLD}username,new_password,new_psk${NC}"
+    echo -e "  ${DIM}password or psk column may be blank (but not both)${NC}"
+    echo ""
+    echo -en "${YELLOW}  ?${NC}  Path to update CSV (or 0 to cancel): "
+    read -r csv_path
+    [ "$csv_path" = "0" ] && return
+
+    if [ ! -f "$csv_path" ]; then
+        print_error "File not found: ${csv_path}"
+        press_enter
+        return
+    fi
+
+    # Phase 1 — validate all lines
+    local line_num=0
+    local error_count=0
+    local valid_users=()
+    local valid_passes=()
+    local valid_psks=()
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        ((line_num++))
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+
+        local csv_user csv_pass csv_psk
+        csv_user=$(echo "$line" | cut -d',' -f1)
+        csv_pass=$(echo "$line" | cut -d',' -f2)
+        csv_psk=$(echo "$line"  | cut -d',' -f3)
+
+        local row_ok=true
+
+        if [ -z "$csv_user" ]; then
+            print_warning "Line ${line_num}: username is empty"
+            row_ok=false
+        elif ! in_list "$csv_user" "$(get_state "USERS_LIST")"; then
+            print_warning "Line ${line_num}: user '${csv_user}' does not exist"
+            row_ok=false
+        fi
+
+        if [ -z "$csv_pass" ] && [ -z "$csv_psk" ]; then
+            print_warning "Line ${line_num}: both password and PSK are empty — nothing to update"
+            row_ok=false
+        fi
+
+        if $row_ok; then
+            valid_users+=("$csv_user")
+            valid_passes+=("$csv_pass")
+            valid_psks+=("$csv_psk")
+        else
+            ((error_count++))
+        fi
+    done < "$csv_path"
+
+    local valid_count="${#valid_users[@]}"
+    echo ""
+    echo -e "  Valid entries  : ${GREEN}${valid_count}${NC}"
+    echo -e "  Invalid entries: ${RED}${error_count}${NC}"
+
+    if [ "$valid_count" -eq 0 ]; then
+        print_warning "No valid entries to process."
+        press_enter
+        return
+    fi
+
+    # Phase 2 — confirm
+    if [ "$error_count" -gt 0 ]; then
+        echo ""
+        if ! ask_yn "  Proceed with ${valid_count} valid entries (skip invalid)?" "n"; then
+            print_info "Cancelled."
+            press_enter
+            return
+        fi
+    else
+        if ! ask_yn "  Update ${valid_count} user(s)?" "y"; then
+            print_info "Cancelled."
+            press_enter
+            return
+        fi
+    fi
+
+    # Phase 3 — apply
+    local updated=0 failed=0
+    local i
+    for i in "${!valid_users[@]}"; do
+        if update_user_credentials "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}"; then
+            ((updated++))
+        else
+            print_error "Failed to update user '${valid_users[$i]}'"
+            ((failed++))
+        fi
+    done
+
+    echo ""
+    print_info "Bulk update complete: ${updated} updated, ${failed} failed."
+    press_enter
+}
+
+#------------------------------------------------------------------------------
+# EXPORT USER LIST
+#------------------------------------------------------------------------------
+
+export_user_list() {
+    print_section "Export User List"
+    local export_file="${PROFILES_BASE}/users_export.csv"
+
+    {
+        echo "# VPN Users Export — generated by vpn-setup.sh"
+        echo "# Format: username,password,psk"
+        echo "# Passwords are not stored — fill them in before re-importing"
+        local users
+        users=$(get_users_list)
+        if [ -n "$users" ]; then
+            while IFS= read -r u; do
+                echo "${u},,"
+            done <<< "$users"
+        fi
+    } > "$export_file"
+
+    print_success "Exported to: ${export_file}"
+    echo ""
+    echo -e "  ${DIM}Fill in passwords and PSKs, then use 'Add multiple users > Import from CSV'.${NC}"
     press_enter
 }
 
