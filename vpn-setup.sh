@@ -1451,6 +1451,19 @@ add_ikev2_user() {
         chmod 600 "/etc/ipsec.d/private/${username}_client.key"
     fi
 
+    # Add per-user cert connection so certificate auth gets an exact rightid match,
+    # giving it higher priority than the wildcard ikev2-eap connection.
+    # Remove stale entry first, then append fresh block.
+    sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
+    cat >> /etc/ipsec.conf << CERT_CONN
+
+# BEGIN ikev2-cert-${username}
+conn ikev2-cert-${username}
+    also=ikev2-cert
+    rightid=${username}@cert.vpn
+# END ikev2-cert-${username}
+CERT_CONN
+
     # Reload strongSwan
     ipsec reload &>/dev/null || ipsec restart &>/dev/null || true
 
@@ -1473,6 +1486,9 @@ remove_ikev2_user() {
     # Remove certs
     rm -f "/etc/ipsec.d/certs/${username}_client.crt"
     rm -f "/etc/ipsec.d/private/${username}_client.key"
+
+    # Remove per-user cert connection block from ipsec.conf
+    sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
 
     ipsec reload &>/dev/null || true
     print_success "IKEv2 user removed: ${username}"
@@ -2469,7 +2485,7 @@ generate_ikev2_cert_mobileconfig() {
                 <key>ExtendedAuthEnabled</key>
                 <integer>0</integer>
                 <key>LocalIdentifier</key>
-                <string>${username}</string>
+                <string>${username}@cert.vpn</string>
                 <key>PayloadCertificateUUID</key>
                 <string>${cert_uuid}</string>
                 <key>RemoteAddress</key>
