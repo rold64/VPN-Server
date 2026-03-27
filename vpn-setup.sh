@@ -1392,7 +1392,7 @@ IPSEC_CONF
     cat > /etc/ipsec.secrets << IPSEC_SECRETS
 # /etc/ipsec.secrets - VPN Credentials
 # Managed by vpn-setup.sh — DO NOT EDIT MANUALLY
-# Format: username : EAP "password"
+# Format: %any username : EAP "password"
 # Format: %any %any : PSK "psk"
 
 : RSA server.key
@@ -1441,9 +1441,10 @@ add_ikev2_user() {
     escaped_pass=$(escape_ipsec "$password")
 
     # Remove existing entry if present
-    sed -i "/^${escaped_user} : EAP /d" /etc/ipsec.secrets
+    # Format: "%any username : EAP ..." — %any is the server wildcard, username is the EAP client identity
+    sed -i "/^%any ${escaped_user} : EAP /d" /etc/ipsec.secrets
 
-    echo "${escaped_user} : EAP \"${escaped_pass}\"" >> /etc/ipsec.secrets
+    echo "%any ${escaped_user} : EAP \"${escaped_pass}\"" >> /etc/ipsec.secrets
 
     # Copy client cert to ipsec.d/certs if it exists
     local user_crt="${CERTS_DIR}/users/${username}/client.crt"
@@ -1479,12 +1480,13 @@ remove_ikev2_user() {
 
     print_step "Removing IKEv2 user: ${username}..."
 
-    # Remove EAP entry
+    # Remove EAP entry (both old format and new %any format)
     sed -i "/^${username} : EAP /d" /etc/ipsec.secrets
-    # Escape and also try
+    sed -i "/^%any ${username} : EAP /d" /etc/ipsec.secrets
     local escaped_user
     escaped_user=$(escape_ipsec "$username")
     sed -i "/^${escaped_user} : EAP /d" /etc/ipsec.secrets
+    sed -i "/^%any ${escaped_user} : EAP /d" /etc/ipsec.secrets
 
     # Remove certs
     rm -f "/etc/ipsec.d/certs/${username}_client.crt"
@@ -2020,7 +2022,7 @@ push \"dhcp-option DNS ${dns2}\""
     local ipv6_directives=""
     if [ "$ipv6_enabled" = "yes" ]; then
         ipv6_directives="
-server-ipv6 fddd:2c4:2c4::/48
+server-ipv6 fddd:2c4:2c4:2c4::/64
 push \"route-ipv6 2000::/3\""
     fi
 
@@ -3474,7 +3476,7 @@ update_user_credentials() {
             local escaped_user escaped_pass
             escaped_user=$(escape_ipsec "$username")
             escaped_pass=$(escape_ipsec "$new_password")
-            sed -i "s|^${escaped_user} : EAP .*|${escaped_user} : EAP \"${escaped_pass}\"|" /etc/ipsec.secrets
+            sed -i "s|^%any ${escaped_user} : EAP .*|%any ${escaped_user} : EAP \"${escaped_pass}\"|" /etc/ipsec.secrets
         fi
 
         # L2TP PPP in chap-secrets

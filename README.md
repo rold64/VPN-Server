@@ -597,6 +597,8 @@ If you need to re-generate profile files (e.g. after changing the server address
 | OpenVPN "user authentication failed" | Auth directory not readable by `nobody:nogroup` | Check `ls -la /etc/openvpn/auth/` — dir must be `750 root:nogroup`, passwd file `640 root:nogroup` |
 | OpenVPN `VERIFY KU ERROR` | Client cert missing `keyUsage: digitalSignature` | Regenerate user with latest script (use **Update user** to regenerate cert) |
 | IKEv2 cert profile stuck at "Connecting", no error | `RemoteAddress` is `1` in mobileconfig (corrupted state file) | Run script, **Advanced → Change server address** to reset state, then regenerate profiles |
+| IKEv2 EAP `no EAP key found for hosts 'IP' - 'user'` | Wrong EAP credential format in `ipsec.secrets` | Regenerate with latest script (`%any user : EAP "pass"` not `user : EAP "pass"`) |
+| OpenVPN fails to start: `network must be between /64 and /124` | IPv6 tunnel subnet used `/48` prefix | Reinstall with latest script (uses `/64`); or edit `server.conf`: `server-ipv6 fddd:2c4:2c4:2c4::/64` |
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
