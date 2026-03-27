@@ -2067,10 +2067,13 @@ OVPN_CONF
 setup_openvpn_auth_script() {
     print_step "Setting up OpenVPN authentication script..."
     mkdir -p "${OPENVPN_DIR}/auth"
+    chown root:nogroup "${OPENVPN_DIR}/auth"
+    chmod 750 "${OPENVPN_DIR}/auth"
 
-    # Create empty credentials file
+    # Create empty credentials file — must be readable by nobody/nogroup (OpenVPN drops privs)
     touch "${OPENVPN_DIR}/auth/users.passwd"
-    chmod 600 "${OPENVPN_DIR}/auth/users.passwd"
+    chown root:nogroup "${OPENVPN_DIR}/auth/users.passwd"
+    chmod 640 "${OPENVPN_DIR}/auth/users.passwd"
 
     # Create verify script
     cat > "${OPENVPN_DIR}/auth/verify.sh" << 'VERIFY_SCRIPT'
@@ -2143,7 +2146,8 @@ add_openvpn_user() {
     sed -i "/^${username}:/d" "${OPENVPN_DIR}/auth/users.passwd"
 
     echo "${username}:${pass_hash}" >> "${OPENVPN_DIR}/auth/users.passwd"
-    chmod 600 "${OPENVPN_DIR}/auth/users.passwd"
+    chown root:nogroup "${OPENVPN_DIR}/auth/users.passwd"
+    chmod 640 "${OPENVPN_DIR}/auth/users.passwd"
 
     # Assign IP (tracked in state)
     local client_ip
