@@ -596,6 +596,7 @@ If you need to re-generate profile files (e.g. after changing the server address
 | OpenVPN connects then immediately drops (iOS/macOS) | `lz4-v2` compression not supported by OpenVPN 3 engine | Regenerate `server.conf` and `.ovpn` profile with latest script (uses `allow-compression no`) |
 | OpenVPN "user authentication failed" | Auth directory not readable by `nobody:nogroup` | Check `ls -la /etc/openvpn/auth/` — dir must be `750 root:nogroup`, passwd file `640 root:nogroup` |
 | OpenVPN `VERIFY KU ERROR` | Client cert missing `keyUsage: digitalSignature` | Regenerate user with latest script (use **Update user** to regenerate cert) |
+| IKEv2 cert profile stuck at "Connecting", no error | `RemoteAddress` is `1` in mobileconfig (corrupted state file) | Run script, **Advanced → Change server address** to reset state, then regenerate profiles |
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
