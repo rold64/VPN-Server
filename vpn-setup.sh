@@ -1311,6 +1311,8 @@ install_ikev2() {
 configure_ikev2() {
     local server_addr
     server_addr=$(get_state "SERVER_ADDRESS")
+    local addr_type
+    addr_type=$(get_state "ADDRESS_TYPE")
     local dns1
     dns1=$(get_state "DNS1")
     local dns2
@@ -1343,7 +1345,7 @@ config setup
 conn %default
     keyexchange=ikev2
     left=%defaultroute
-    leftid=@${server_addr}
+    leftid=$([ "$addr_type" = "dns" ] && echo "@${server_addr}" || echo "${server_addr}")
     leftcert=server.crt
     leftsendcert=always
     leftsubnet=0.0.0.0/0
@@ -2030,12 +2032,10 @@ username-as-common-name
 # Client settings
 ${push_dns}
 push "redirect-gateway def1 bypass-dhcp"
-push "block-outside-dns"
 
 # Connection
 keepalive 10 120
-compress lz4-v2
-push "compress lz4-v2"
+allow-compression no
 max-clients 100
 user nobody
 group nogroup
@@ -2819,8 +2819,6 @@ cipher AES-256-GCM
 auth SHA256
 tls-version-min 1.2
 tls-cipher TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384:TLS-DHE-RSA-WITH-AES-256-GCM-SHA384
-
-compress lz4-v2
 
 verb 3
 mute 20
@@ -3799,7 +3797,9 @@ change_server_address_menu() {
 
     # Update ipsec.conf server ID
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
-        sed -i "s|leftid=@.*|leftid=@${new_addr}|" /etc/ipsec.conf 2>/dev/null || true
+        local new_leftid
+        new_leftid=$([ "$new_type" = "dns" ] && echo "@${new_addr}" || echo "${new_addr}")
+        sed -i "s|leftid=.*|leftid=${new_leftid}|" /etc/ipsec.conf 2>/dev/null || true
         service_restart "strongswan"
     fi
 
