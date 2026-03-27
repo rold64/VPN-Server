@@ -2349,8 +2349,6 @@ generate_ikev2_eap_mobileconfig() {
                 <integer>1</integer>
                 <key>LocalIdentifier</key>
                 <string>${username}</string>
-                <key>PayloadCertificateUUID</key>
-                <string></string>
                 <key>RemoteAddress</key>
                 <string>${server_addr}</string>
                 <key>RemoteIdentifier</key>
