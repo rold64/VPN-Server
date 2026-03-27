@@ -566,8 +566,11 @@ fw_add() {
 
 fw_insert() {
     # Insert iptables rule at position 1 if not already present
-    if ! iptables -C "$@" &>/dev/null; then
-        iptables -I "$@" 1
+    # Syntax: iptables -I CHAIN 1 <rule> (position must come right after chain name)
+    local chain="$1"
+    shift
+    if ! iptables -C "$chain" "$@" &>/dev/null; then
+        iptables -I "$chain" 1 "$@"
     fi
 }
 
@@ -1458,11 +1461,25 @@ remove_ikev2_user() {
 
 install_l2tp_packages() {
     print_step "Installing xl2tpd and PPP packages..."
+
+    # Load PPP kernel modules before installing — xl2tpd requires them at startup
+    modprobe ppp_generic 2>/dev/null || true
+    modprobe ppp_async   2>/dev/null || true
+    modprobe ppp_mppe    2>/dev/null || true
+
     if is_debian_based; then
-        DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL xl2tpd ppp" || {
-            print_error "Failed to install xl2tpd. Check that your repositories are configured."
+        # Mask xl2tpd before install: the package post-install script tries to start
+        # the service, which fails because the config file doesn't exist yet.
+        # We unmask after install and start it ourselves after writing the config.
+        systemctl mask xl2tpd 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL xl2tpd ppp" || true
+        systemctl unmask xl2tpd 2>/dev/null || true
+
+        # Verify the binary was actually installed
+        if ! cmd_exists xl2tpd; then
+            print_error "xl2tpd binary not found after install. Check apt logs."
             exit 1
-        }
+        fi
     elif is_rhel_based; then
         # xl2tpd needs EPEL on RHEL-based
         install_epel
@@ -1471,6 +1488,7 @@ install_l2tp_packages() {
             exit 1
         }
     fi
+    print_success "xl2tpd and ppp installed."
 }
 
 install_l2tp() {
