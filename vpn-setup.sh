@@ -184,6 +184,12 @@ b64_file() {
     base64 -w 0 "$1" 2>/dev/null || base64 "$1"
 }
 
+# Base64-encode a PEM certificate as DER (required for Apple mobileconfig <data> elements)
+b64_cert() {
+    openssl x509 -in "$1" -outform DER 2>/dev/null | base64 -w 0 2>/dev/null || \
+    openssl x509 -in "$1" -outform DER 2>/dev/null | base64
+}
+
 # Check if a value is in a comma-separated list
 in_list() {
     local needle="$1"
@@ -1224,6 +1230,7 @@ generate_client_cert() {
     # Write extensions file (extfile approach for OpenSSL 3.x compatibility)
     cat > "$client_ext" << 'EXT_EOF'
 [v3_client]
+keyUsage = critical,digitalSignature
 extendedKeyUsage = clientAuth
 EXT_EOF
 
@@ -2317,7 +2324,7 @@ generate_ikev2_eap_mobileconfig() {
     ca_uuid=$(generate_uuid)
 
     local ca_b64
-    ca_b64=$(b64_file "${CERTS_DIR}/ca.crt")
+    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2_eap.mobileconfig"
 
     print_step "Generating IKEv2 EAP (user/pass) mobileconfig..."
@@ -2438,7 +2445,7 @@ generate_ikev2_cert_mobileconfig() {
     ca_uuid=$(generate_uuid)
 
     local ca_b64 p12_b64
-    ca_b64=$(b64_file "${CERTS_DIR}/ca.crt")
+    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
     p12_b64=$(b64_file "${CERTS_DIR}/users/${username}/client.p12")
 
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2_cert.mobileconfig"
@@ -2577,7 +2584,7 @@ generate_ikev2_sswan() {
     uuid2=$(generate_uuid | tr '[:upper:]' '[:lower:]')
 
     local ca_b64 p12_b64
-    ca_b64=$(b64_file "${CERTS_DIR}/ca.crt")
+    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
     p12_b64=$(b64_file "${CERTS_DIR}/users/${username}/client.p12")
 
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2.sswan"
