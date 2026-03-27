@@ -15,7 +15,7 @@ IKEv2/IPsec · L2TP/IPsec · WireGuard · OpenVPN
 
 ---
 
-## ✨ Overview
+##  Overview
 
 This script sets up a **production-ready multi-protocol VPN server** from scratch with a single command. It handles everything — package installation, certificate generation, firewall rules, user management, and client profile files — across all major Linux distributions.
 
