@@ -2576,6 +2576,15 @@ generate_ikev2_eap_mobileconfig() {
 
     print_step "Generating IKEv2 EAP (user/pass) mobileconfig..."
 
+    # ServerCertificateIssuerCommonName: only valid for self-signed.
+    # In LE mode the issuer is Let's Encrypt's intermediate CA (R11/E1/etc.) — hardcoding
+    # "VPN Root CA" here would cause iOS to reject the server cert.
+    local issuer_key=""
+    if ! is_letsencrypt; then
+        issuer_key="                <key>ServerCertificateIssuerCommonName</key>
+                <string>VPN Root CA</string>"
+    fi
+
     # Build the CA cert payload (only needed for self-signed; LE is natively trusted)
     local ca_payload=""
     if ! is_letsencrypt; then
@@ -2625,8 +2634,7 @@ ${ca_b64}
                 <string>${username}</string>
                 <key>AuthPassword</key>
                 <string></string>
-                <key>ServerCertificateIssuerCommonName</key>
-                <string>VPN Root CA</string>
+${issuer_key}
                 <key>IKESecurityAssociationParameters</key>
                 <dict>
                     <key>EncryptionAlgorithm</key>
@@ -2663,7 +2671,8 @@ ${ca_b64}
             <key>VPNType</key>
             <string>IKEv2</string>
         </dict>
-${ca_payload}    </array>
+${ca_payload}
+    </array>
     <key>PayloadDescription</key>
     <string>IKEv2 VPN configuration for ${username} (Username/Password)</string>
     <key>PayloadDisplayName</key>
@@ -2810,7 +2819,8 @@ ${p12_b64}
             <key>PayloadVersion</key>
             <integer>1</integer>
         </dict>
-${ca_payload}    </array>
+${ca_payload}
+    </array>
     <key>PayloadDescription</key>
     <string>IKEv2 VPN (Certificate) for ${username}</string>
     <key>PayloadDisplayName</key>
@@ -4111,9 +4121,8 @@ change_server_address_menu() {
 
     # Regenerate server cert for new address
     print_step "Regenerating server certificate..."
-    local cert_obtained=false
     if [ "$new_type" = "dns" ] && obtain_letsencrypt_cert "$new_addr" "$le_email"; then
-        cert_obtained=true
+        true  # LE cert obtained; obtain_letsencrypt_cert already saved CERT_TYPE=letsencrypt
     else
         if [ "$new_type" = "dns" ]; then
             print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
@@ -4474,21 +4483,15 @@ renew_letsencrypt_menu() {
     local domain
     domain=$(get_state "LE_DOMAIN")
     echo -e "  Current domain: ${BOLD}${domain}${NC}"
+    echo -e "  ${DIM}Port 80 will be opened temporarily (managed by renewal hooks).${NC}"
     echo ""
     if ! ask_yn "Force renewal of Let's Encrypt certificate?" "y"; then
         return
     fi
 
-    # Pre-hook: open port 80
-    iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-
     print_step "Forcing certificate renewal..."
+    # Pre/post hooks manage port 80; deploy hook copies certs and restarts services.
     certbot renew --cert-name vpn-server --force-renewal 2>&1
-
-    # Post-hook: close port 80
-    iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
 
     print_success "Renewal complete. Deploy hook has restarted VPN services."
     press_enter
