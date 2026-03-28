@@ -19,6 +19,7 @@ STATE_FILE="${STATE_DIR}/state.conf"
 CERTS_DIR="${STATE_DIR}/certs"
 PROFILES_BASE="/etc/VPN User Profiles"
 OPENVPN_DIR="/etc/openvpn"
+LE_CERTS_BASE="/etc/letsencrypt/live"
 
 # VPN IP Ranges
 IKEV2_SERVER_IP="10.10.10.1"
@@ -692,6 +693,32 @@ detect_system_dns() {
     echo "$dns1 $dns2"
 }
 
+validate_dns_resolves() {
+    # Returns 0 if hostname resolves to this server's IP, 1 if no resolution, 2 if wrong IP.
+    local hostname="$1"
+    local server_ip
+    server_ip=$(get_public_ip)
+
+    local resolved_ip=""
+    if command -v getent >/dev/null 2>&1; then
+        resolved_ip=$(getent hosts "$hostname" 2>/dev/null | awk '{print $1}' | head -1)
+    fi
+    if [ -z "$resolved_ip" ] && command -v dig >/dev/null 2>&1; then
+        resolved_ip=$(dig +short "$hostname" A 2>/dev/null | grep -E '^[0-9]' | head -1)
+    fi
+    if [ -z "$resolved_ip" ] && command -v host >/dev/null 2>&1; then
+        resolved_ip=$(host "$hostname" 2>/dev/null | grep "has address" | head -1 | awk '{print $NF}')
+    fi
+
+    if [ -z "$resolved_ip" ]; then
+        return 1
+    fi
+    if [ -n "$server_ip" ] && [ "$resolved_ip" != "$server_ip" ]; then
+        return 2
+    fi
+    return 0
+}
+
 get_dns_ipv4() {
     # Returns "primary secondary" for a given DNS choice number
     case "$1" in
@@ -745,6 +772,7 @@ SETUP_DNS2_V6=""      # Secondary DNS IPv6
 SETUP_USERNAME=""
 SETUP_PASSWORD=""
 SETUP_PSK=""
+SETUP_LE_EMAIL=""     # Email for Let's Encrypt certificate (DNS mode only)
 
 ask_vpn_selection() {
     print_section "VPN Server Selection"
@@ -806,6 +834,18 @@ ask_server_address() {
                         break
                     else
                         print_warning "  Hostname cannot be empty."
+                    fi
+                done
+                echo ""
+                echo -e "  ${DIM}A Let's Encrypt certificate will be requested for this hostname.${NC}"
+                echo -e "  ${DIM}Requires the hostname to resolve to this server and port 80 to be reachable.${NC}"
+                while true; do
+                    echo -en "${YELLOW}  ?${NC}  Email for Let's Encrypt (required): "
+                    read -r SETUP_LE_EMAIL
+                    if [ -n "$SETUP_LE_EMAIL" ]; then
+                        break
+                    else
+                        print_warning "  Email cannot be empty."
                     fi
                 done
                 break
@@ -1125,6 +1165,138 @@ setup_firewall_base() {
 
     save_iptables
     print_success "Base firewall rules configured."
+}
+
+#==============================================================================
+# LET'S ENCRYPT CERTIFICATE SUPPORT
+#==============================================================================
+
+is_letsencrypt() {
+    [ "$(get_state "CERT_TYPE")" = "letsencrypt" ]
+}
+
+install_certbot() {
+    if command -v certbot >/dev/null 2>&1; then return 0; fi
+    print_step "Installing certbot..."
+    if is_debian_based; then
+        apt-get install -y certbot 2>/dev/null
+    elif is_rhel_based; then
+        dnf install -y certbot 2>/dev/null || yum install -y certbot 2>/dev/null
+    fi
+    command -v certbot >/dev/null 2>&1
+}
+
+obtain_letsencrypt_cert() {
+    local domain="$1"
+    local email="$2"
+
+    print_step "Obtaining Let's Encrypt certificate for ${domain}..."
+
+    # Validate DNS resolution before attempting
+    local dns_status
+    validate_dns_resolves "$domain"; dns_status=$?
+    if [ $dns_status -eq 1 ]; then
+        print_error "DNS for '${domain}' does not resolve. Cannot obtain Let's Encrypt certificate."
+        return 1
+    elif [ $dns_status -eq 2 ]; then
+        print_warning "DNS for '${domain}' resolves but not to this server's IP. Proceeding anyway."
+    fi
+
+    install_certbot || { print_error "Failed to install certbot."; return 1; }
+
+    # Temporarily open port 80 for HTTP-01 challenge
+    iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+
+    certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$email" \
+        -d "$domain" \
+        --cert-name "vpn-server" \
+        2>&1 | tee /tmp/certbot_output.log
+
+    local certbot_status=${PIPESTATUS[0]}
+
+    # Close port 80
+    iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+
+    if [ $certbot_status -ne 0 ]; then
+        print_error "certbot failed. Check /tmp/certbot_output.log for details."
+        return 1
+    fi
+
+    # Copy LE certs into our cert store
+    local le_dir="${LE_CERTS_BASE}/vpn-server"
+    cp "${le_dir}/fullchain.pem" "${CERTS_DIR}/server.crt"
+    cp "${le_dir}/privkey.pem"   "${CERTS_DIR}/server.key"
+    cp "${le_dir}/chain.pem"     "${CERTS_DIR}/le_chain.crt"
+    chmod 600 "${CERTS_DIR}/server.key"
+
+    save_state "CERT_TYPE"  "letsencrypt"
+    save_state "LE_DOMAIN"  "$domain"
+    save_state "LE_EMAIL"   "$email"
+
+    # Create deploy hook for automatic renewal
+    _write_le_deploy_hooks
+
+    print_success "Let's Encrypt certificate obtained for ${domain}."
+}
+
+_write_le_deploy_hooks() {
+    # Deploy hook: copy renewed certs and restart VPN services
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    mkdir -p /etc/letsencrypt/renewal-hooks/pre
+    mkdir -p /etc/letsencrypt/renewal-hooks/post
+
+    cat > /etc/letsencrypt/renewal-hooks/deploy/vpn-cert-deploy.sh << 'DEPLOY_HOOK'
+#!/bin/bash
+# Runs after each successful certbot renewal
+LE_DIR="/etc/letsencrypt/live/vpn-server"
+CERTS_DIR="/etc/vpn-setup/certs"
+
+cp "${LE_DIR}/fullchain.pem" "${CERTS_DIR}/server.crt"
+cp "${LE_DIR}/privkey.pem"   "${CERTS_DIR}/server.key"
+cp "${LE_DIR}/chain.pem"     "${CERTS_DIR}/le_chain.crt"
+chmod 600 "${CERTS_DIR}/server.key"
+
+# IKEv2 (strongSwan)
+if [ -d /etc/ipsec.d ]; then
+    cp "${CERTS_DIR}/server.crt" /etc/ipsec.d/certs/server.crt
+    cp "${CERTS_DIR}/server.key" /etc/ipsec.d/private/server.key
+    chmod 600 /etc/ipsec.d/private/server.key
+    ipsec restart >/dev/null 2>&1 || true
+fi
+
+# OpenVPN
+if [ -d /etc/openvpn/server ]; then
+    cp "${CERTS_DIR}/server.crt" /etc/openvpn/server/server.crt
+    cp "${CERTS_DIR}/server.key" /etc/openvpn/server/server.key
+    chmod 600 /etc/openvpn/server/server.key
+    systemctl restart openvpn@server >/dev/null 2>&1 || true
+fi
+DEPLOY_HOOK
+    chmod 700 /etc/letsencrypt/renewal-hooks/deploy/vpn-cert-deploy.sh
+
+    # Pre-hook: open port 80 before renewal attempt
+    cat > /etc/letsencrypt/renewal-hooks/pre/vpn-open-port80.sh << 'PRE_HOOK'
+#!/bin/bash
+iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+PRE_HOOK
+    chmod 700 /etc/letsencrypt/renewal-hooks/pre/vpn-open-port80.sh
+
+    # Post-hook: close port 80 after renewal attempt
+    cat > /etc/letsencrypt/renewal-hooks/post/vpn-close-port80.sh << 'POST_HOOK'
+#!/bin/bash
+iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+POST_HOOK
+    chmod 700 /etc/letsencrypt/renewal-hooks/post/vpn-close-port80.sh
+
+    print_success "Let's Encrypt renewal hooks installed."
 }
 
 #==============================================================================
@@ -2400,11 +2572,34 @@ generate_ikev2_eap_mobileconfig() {
     display_uuid=$(generate_uuid)
     ca_uuid=$(generate_uuid)
 
-    local ca_b64
-    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2_eap.mobileconfig"
 
     print_step "Generating IKEv2 EAP (user/pass) mobileconfig..."
+
+    # Build the CA cert payload (only needed for self-signed; LE is natively trusted)
+    local ca_payload=""
+    if ! is_letsencrypt; then
+        local ca_b64
+        ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
+        ca_payload="        <dict>
+            <key>PayloadContent</key>
+            <data>
+${ca_b64}
+            </data>
+            <key>PayloadDescription</key>
+            <string>VPN Root CA Certificate</string>
+            <key>PayloadDisplayName</key>
+            <string>VPN Root CA</string>
+            <key>PayloadIdentifier</key>
+            <string>com.vpn.ca.${username}</string>
+            <key>PayloadType</key>
+            <string>com.apple.security.root</string>
+            <key>PayloadUUID</key>
+            <string>${ca_uuid}</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+        </dict>"
+    fi
 
     cat > "$out_file" << MCONFIG_EAP
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2430,6 +2625,8 @@ generate_ikev2_eap_mobileconfig() {
                 <string>${username}</string>
                 <key>AuthPassword</key>
                 <string></string>
+                <key>ServerCertificateIssuerCommonName</key>
+                <string>VPN Root CA</string>
                 <key>IKESecurityAssociationParameters</key>
                 <dict>
                     <key>EncryptionAlgorithm</key>
@@ -2466,25 +2663,7 @@ generate_ikev2_eap_mobileconfig() {
             <key>VPNType</key>
             <string>IKEv2</string>
         </dict>
-        <dict>
-            <key>PayloadContent</key>
-            <data>
-${ca_b64}
-            </data>
-            <key>PayloadDescription</key>
-            <string>VPN Root CA Certificate</string>
-            <key>PayloadDisplayName</key>
-            <string>VPN Root CA</string>
-            <key>PayloadIdentifier</key>
-            <string>com.vpn.ca.${username}</string>
-            <key>PayloadType</key>
-            <string>com.apple.security.root</string>
-            <key>PayloadUUID</key>
-            <string>${ca_uuid}</string>
-            <key>PayloadVersion</key>
-            <integer>1</integer>
-        </dict>
-    </array>
+${ca_payload}    </array>
     <key>PayloadDescription</key>
     <string>IKEv2 VPN configuration for ${username} (Username/Password)</string>
     <key>PayloadDisplayName</key>
@@ -2519,9 +2698,33 @@ generate_ikev2_cert_mobileconfig() {
     cert_uuid=$(generate_uuid)
     ca_uuid=$(generate_uuid)
 
-    local ca_b64 p12_b64
-    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
+    local p12_b64
     p12_b64=$(b64_file "${CERTS_DIR}/users/${username}/client.p12")
+
+    # Build CA cert payload (only for self-signed; LE is natively trusted)
+    local ca_payload=""
+    if ! is_letsencrypt; then
+        local ca_b64
+        ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
+        ca_payload="        <dict>
+            <key>PayloadContent</key>
+            <data>
+${ca_b64}
+            </data>
+            <key>PayloadDescription</key>
+            <string>VPN Root CA Certificate</string>
+            <key>PayloadDisplayName</key>
+            <string>VPN Root CA</string>
+            <key>PayloadIdentifier</key>
+            <string>com.vpn.ca.cert.${username}</string>
+            <key>PayloadType</key>
+            <string>com.apple.security.root</string>
+            <key>PayloadUUID</key>
+            <string>${ca_uuid}</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+        </dict>"
+    fi
 
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2_cert.mobileconfig"
 
@@ -2607,25 +2810,7 @@ ${p12_b64}
             <key>PayloadVersion</key>
             <integer>1</integer>
         </dict>
-        <dict>
-            <key>PayloadContent</key>
-            <data>
-${ca_b64}
-            </data>
-            <key>PayloadDescription</key>
-            <string>VPN Root CA Certificate</string>
-            <key>PayloadDisplayName</key>
-            <string>VPN Root CA</string>
-            <key>PayloadIdentifier</key>
-            <string>com.vpn.ca.cert.${username}</string>
-            <key>PayloadType</key>
-            <string>com.apple.security.root</string>
-            <key>PayloadUUID</key>
-            <string>${ca_uuid}</string>
-            <key>PayloadVersion</key>
-            <integer>1</integer>
-        </dict>
-    </array>
+${ca_payload}    </array>
     <key>PayloadDescription</key>
     <string>IKEv2 VPN (Certificate) for ${username}</string>
     <key>PayloadDisplayName</key>
@@ -2867,9 +3052,15 @@ generate_openvpn_ovpn() {
     local dns1
     dns1=$(get_state "DNS1")
 
-    local ca_crt_content server_crt_content client_crt_content client_key_content ta_key_content
+    local ca_crt_content client_crt_content client_key_content ta_key_content
 
-    ca_crt_content=$(cat "${CERTS_DIR}/ca.crt")
+    # In LE mode, use the LE intermediate chain so the client can verify the LE server cert.
+    # In self-signed mode, use our own CA cert.
+    if is_letsencrypt; then
+        ca_crt_content=$(cat "${CERTS_DIR}/le_chain.crt")
+    else
+        ca_crt_content=$(cat "${CERTS_DIR}/ca.crt")
+    fi
     client_crt_content=$(cat "${CERTS_DIR}/users/${username}/client.crt")
     client_key_content=$(cat "${CERTS_DIR}/users/${username}/client.key")
     ta_key_content=$(cat "${OPENVPN_DIR}/server/ta.key")
@@ -3894,16 +4085,49 @@ change_server_address_menu() {
         return
     fi
 
+    # Ask for LE email if switching to DNS mode
+    local le_email=""
+    if [ "$new_type" = "dns" ]; then
+        local existing_email
+        existing_email=$(get_state "LE_EMAIL")
+        echo ""
+        echo -e "  ${DIM}A Let's Encrypt certificate can be obtained for this hostname.${NC}"
+        if [ -n "$existing_email" ]; then
+            echo -en "${YELLOW}  ?${NC}  Email for Let's Encrypt [${existing_email}]: "
+            read -r le_email
+            [ -z "$le_email" ] && le_email="$existing_email"
+        else
+            while true; do
+                echo -en "${YELLOW}  ?${NC}  Email for Let's Encrypt (required): "
+                read -r le_email
+                [ -n "$le_email" ] && break
+                print_warning "  Email cannot be empty."
+            done
+        fi
+    fi
+
     save_state "SERVER_ADDRESS" "$new_addr"
     save_state "ADDRESS_TYPE" "$new_type"
 
     # Regenerate server cert for new address
     print_step "Regenerating server certificate..."
-    generate_server_cert "$new_addr" "$new_type"
+    local cert_obtained=false
+    if [ "$new_type" = "dns" ] && obtain_letsencrypt_cert "$new_addr" "$le_email"; then
+        cert_obtained=true
+    else
+        if [ "$new_type" = "dns" ]; then
+            print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
+        fi
+        generate_server_cert "$new_addr" "$new_type"
+        save_state "CERT_TYPE" "self-signed"
+    fi
+
     cp "${CERTS_DIR}/server.crt" /etc/ipsec.d/certs/ 2>/dev/null || true
     cp "${CERTS_DIR}/server.key" /etc/ipsec.d/private/ 2>/dev/null || true
+    chmod 600 /etc/ipsec.d/private/server.key 2>/dev/null || true
     cp "${CERTS_DIR}/server.crt" "${OPENVPN_DIR}/server/" 2>/dev/null || true
     cp "${CERTS_DIR}/server.key" "${OPENVPN_DIR}/server/" 2>/dev/null || true
+    chmod 600 "${OPENVPN_DIR}/server/server.key" 2>/dev/null || true
 
     # Update ipsec.conf server ID
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
@@ -4218,6 +4442,9 @@ show_advanced_menu() {
         echo -e "  ${BOLD}3)${NC} Access VPN clients from server's subnet"
         echo -e "  ${BOLD}4)${NC} Port Forwarding to VPN clients"
         echo -e "  ${BOLD}5)${NC} Disable IPv6"
+        if is_letsencrypt; then
+            echo -e "  ${BOLD}6)${NC} Renew Let's Encrypt certificate"
+        fi
         echo -e "  ${BOLD}0)${NC} Back"
         echo ""
         echo -en "${YELLOW}  ?${NC}  Enter choice: "
@@ -4229,10 +4456,42 @@ show_advanced_menu() {
             3) client_subnet_access_menu ;;
             4) port_forwarding_menu ;;
             5) disable_ipv6_menu ;;
+            6)
+                if is_letsencrypt; then
+                    renew_letsencrypt_menu
+                else
+                    print_warning "Invalid choice."
+                fi
+                ;;
             0) return ;;
             *) print_warning "Invalid choice." ;;
         esac
     done
+}
+
+renew_letsencrypt_menu() {
+    print_section "Renew Let's Encrypt Certificate"
+    local domain
+    domain=$(get_state "LE_DOMAIN")
+    echo -e "  Current domain: ${BOLD}${domain}${NC}"
+    echo ""
+    if ! ask_yn "Force renewal of Let's Encrypt certificate?" "y"; then
+        return
+    fi
+
+    # Pre-hook: open port 80
+    iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+
+    print_step "Forcing certificate renewal..."
+    certbot renew --cert-name vpn-server --force-renewal 2>&1
+
+    # Post-hook: close port 80
+    iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+
+    print_success "Renewal complete. Deploy hook has restarted VPN services."
+    press_enter
 }
 
 #==============================================================================
@@ -4782,6 +5041,7 @@ first_run_setup() {
     save_state "SETUP_DATE"      "$(date '+%Y-%m-%d %H:%M:%S')"
     [ -n "$SETUP_DNS1_V6" ] && save_state "DNS1_IPV6" "$SETUP_DNS1_V6"
     [ -n "$SETUP_DNS2_V6" ] && save_state "DNS2_IPV6" "$SETUP_DNS2_V6"
+    [ -n "$SETUP_LE_EMAIL" ] && save_state "LE_EMAIL" "$SETUP_LE_EMAIL"
 
     # Step 5: System preparation
     system_update
@@ -4791,7 +5051,15 @@ first_run_setup() {
 
     # Step 6: Generate CA and server certificate
     generate_ca_cert
-    generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
+    if [ "$SETUP_ADDR_TYPE" = "dns" ] && obtain_letsencrypt_cert "$SETUP_ADDRESS" "$SETUP_LE_EMAIL"; then
+        print_success "Using Let's Encrypt certificate for ${SETUP_ADDRESS}."
+    else
+        if [ "$SETUP_ADDR_TYPE" = "dns" ]; then
+            print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
+        fi
+        generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
+        save_state "CERT_TYPE" "self-signed"
+    fi
 
     # Step 7: Install selected VPN servers
     if in_list "$VPN_IKEV2" "$SETUP_VPNS"; then
