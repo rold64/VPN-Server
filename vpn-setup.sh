@@ -2853,16 +2853,52 @@ generate_ikev2_sswan() {
     uuid1=$(generate_uuid | tr '[:upper:]' '[:lower:]')
     uuid2=$(generate_uuid | tr '[:upper:]' '[:lower:]')
 
-    local ca_b64 p12_b64
-    ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
+    local p12_b64
     p12_b64=$(b64_file "${CERTS_DIR}/users/${username}/client.p12")
 
     local out_file="${PROFILES_BASE}/${username}/${username}_ikev2.sswan"
+    local out_file_cert="${PROFILES_BASE}/${username}/${username}_ikev2_cert.sswan"
 
     print_step "Generating IKEv2 Android strongSwan profile..."
 
-    # Create a sswan file that includes both EAP and certificate profiles
-    cat > "$out_file" << SSWAN_JSON
+    # In LE mode, omit remote.cert entirely — Android strongSwan falls back to the
+    # system trust store (which includes LE's root CA). Embedding our own CA cert
+    # would cause validation failure because LE certs are not signed by our CA.
+    if is_letsencrypt; then
+        cat > "$out_file" << SSWAN_JSON_LE
+{
+  "uuid": "${uuid1}",
+  "name": "IKEv2 VPN (${username}) - EAP",
+  "type": "ikev2-eap",
+  "remote": {
+    "addr": "${server_addr}",
+    "id": "${server_addr}"
+  },
+  "local": {
+    "eap_id": "${username}"
+  },
+  "password": "${password}"
+}
+SSWAN_JSON_LE
+        cat > "$out_file_cert" << SSWAN_CERT_JSON_LE
+{
+  "uuid": "${uuid2}",
+  "name": "IKEv2 VPN (${username}) - Certificate",
+  "type": "ikev2-cert",
+  "remote": {
+    "addr": "${server_addr}",
+    "id": "${server_addr}"
+  },
+  "local": {
+    "p12": "${p12_b64}",
+    "password": "${password}"
+  }
+}
+SSWAN_CERT_JSON_LE
+    else
+        local ca_b64
+        ca_b64=$(b64_cert "${CERTS_DIR}/ca.crt")
+        cat > "$out_file" << SSWAN_JSON
 {
   "uuid": "${uuid1}",
   "name": "IKEv2 VPN (${username}) - EAP",
@@ -2878,10 +2914,7 @@ generate_ikev2_sswan() {
   "password": "${password}"
 }
 SSWAN_JSON
-
-    # Also create a certificate-based sswan file
-    local out_file_cert="${PROFILES_BASE}/${username}/${username}_ikev2_cert.sswan"
-    cat > "$out_file_cert" << SSWAN_CERT_JSON
+        cat > "$out_file_cert" << SSWAN_CERT_JSON
 {
   "uuid": "${uuid2}",
   "name": "IKEv2 VPN (${username}) - Certificate",
@@ -2897,6 +2930,7 @@ SSWAN_JSON
   }
 }
 SSWAN_CERT_JSON
+    fi
 
     chmod 600 "$out_file" "$out_file_cert"
     print_done "IKEv2 Android profiles: ${out_file}, ${out_file_cert}"
@@ -2931,13 +2965,19 @@ if (Get-VpnConnection -Name \$VpnName -ErrorAction SilentlyContinue) {
     Write-Host "Removed existing VPN connection."
 }
 
-# Install CA Certificate (import the CA cert file first)
+# Install CA Certificate (only needed for self-signed server certs)
+# In Let's Encrypt mode the server cert is publicly trusted — no CA import required.
 \$caCertPath = Join-Path \$PSScriptRoot "${username}_ca.crt"
-if (Test-Path \$caCertPath) {
-    Import-Certificate -FilePath \$caCertPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-    Write-Host "CA certificate installed." -ForegroundColor Green
+\$isLetsEncrypt = $(is_letsencrypt && echo '$true' || echo '$false')
+if (-not \$isLetsEncrypt) {
+    if (Test-Path \$caCertPath) {
+        Import-Certificate -FilePath \$caCertPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+        Write-Host "CA certificate installed." -ForegroundColor Green
+    } else {
+        Write-Warning "CA certificate not found at \$caCertPath. Import it manually."
+    }
 } else {
-    Write-Warning "CA certificate not found at \$caCertPath. Import it manually."
+    Write-Host "Let's Encrypt certificate in use — no CA import needed." -ForegroundColor Cyan
 }
 
 # Install Client Certificate (P12)
@@ -3236,7 +3276,12 @@ CREDENTIALS
  CA CERTIFICATE
 ================================================================================
   File: ${username}_ca.crt
-  Import this certificate as a trusted CA on your device/system.
+$(is_letsencrypt && echo "  This certificate is NOT needed for device trust — the server uses a
+  Let's Encrypt certificate which is publicly trusted on all devices.
+  It is included for reference only (signs client certificates for IKEv2 cert auth)." \
+|| echo "  Import this certificate as a trusted CA on your device/system.
+  Required for IKEv2 (EAP and Certificate) and OpenVPN on devices
+  that do not automatically trust self-signed certificates.")
 
 ================================================================================
 INFO
