@@ -654,10 +654,48 @@ get_public_ipv6() {
 # DNS CONFIGURATION MAPS
 #==============================================================================
 
+detect_system_dns() {
+    # Detect the server's real upstream DNS resolvers (not loopback stubs).
+    # Returns "dns1 dns2" space-separated. If only one is found, dns2=dns1.
+    # Skips 127.x.x.x addresses — those are unreachable from VPN clients.
+    local all=""
+
+    # Priority 1: systemd-resolved global upstream (Ubuntu 18+, Debian 10+)
+    if command -v resolvectl >/dev/null 2>&1; then
+        all=$(resolvectl dns 2>/dev/null \
+              | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+              | grep -v '^127\.' | head -2 | tr '\n' ' ')
+    fi
+
+    # Priority 2: /run/systemd/resolve/resolv.conf (real upstream, not 127.0.0.53 stub)
+    if [ -z "$all" ] && [ -f /run/systemd/resolve/resolv.conf ]; then
+        all=$(grep "^nameserver" /run/systemd/resolve/resolv.conf \
+              | awk '{print $2}' | grep -v '^127\.' | head -2 | tr '\n' ' ')
+    fi
+
+    # Priority 3: /etc/resolv.conf, skip loopback addresses
+    if [ -z "$all" ]; then
+        all=$(grep "^nameserver" /etc/resolv.conf \
+              | awk '{print $2}' | grep -v '^127\.' | head -2 | tr '\n' ' ')
+    fi
+
+    # Priority 4: NetworkManager
+    if [ -z "$all" ] && command -v nmcli >/dev/null 2>&1; then
+        all=$(nmcli dev show 2>/dev/null | grep "IP4\.DNS" \
+              | awk '{print $2}' | grep -v '^127\.' | head -2 | tr '\n' ' ')
+    fi
+
+    local dns1 dns2
+    dns1=$(echo "$all" | awk '{print $1}')
+    dns2=$(echo "$all" | awk '{print $2}')
+    [ -z "$dns2" ] && dns2="$dns1"
+    echo "$dns1 $dns2"
+}
+
 get_dns_ipv4() {
     # Returns "primary secondary" for a given DNS choice number
     case "$1" in
-        1) echo "127.0.0.1 127.0.0.1" ;;          # Internal
+        1) detect_system_dns ;;                     # Internal — detect real upstream
         2) echo "1.1.1.1 1.0.0.1" ;;              # Cloudflare
         3) echo "94.140.14.14 94.140.15.15" ;;    # AdGuard
         4) echo "8.8.8.8 8.8.4.4" ;;              # Google
@@ -814,7 +852,7 @@ ask_dns_servers() {
     echo -e "  Select up to two DNS servers for VPN clients."
     echo -e "  ${DIM}(Enter two numbers separated by space, or one number for both primary/secondary)${NC}"
     echo ""
-    echo -e "  ${BOLD}1)${NC} Server's Internal DNS  ${DIM}(127.0.0.1)${NC}"
+    echo -e "  ${BOLD}1)${NC} Server's Internal DNS  ${DIM}(auto-detected)${NC}"
     echo -e "  ${BOLD}2)${NC} Cloudflare             ${DIM}(1.1.1.1, 1.0.0.1)${NC}"
     echo -e "  ${BOLD}3)${NC} AdGuard                ${DIM}(94.140.14.14, 94.140.15.15)${NC}"
     echo -e "  ${BOLD}4)${NC} Google                 ${DIM}(8.8.8.8, 8.8.4.4)${NC}"
@@ -847,6 +885,13 @@ ask_dns_servers() {
         SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $2}')
     else
         SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $1}')
+    fi
+
+    # If internal DNS selected but detection failed, fall back to Cloudflare
+    if { [ "$d1" = "1" ] || [ "$d2" = "1" ]; } && [ -z "$SETUP_DNS1" ]; then
+        print_warning "  Could not detect system DNS. Falling back to Cloudflare (1.1.1.1)."
+        SETUP_DNS1="1.1.1.1"
+        SETUP_DNS2="1.0.0.1"
     fi
 
     if [ "$SETUP_IPV6" = "yes" ]; then
@@ -3865,7 +3910,7 @@ change_dns_menu() {
     echo -e "  Select up to two DNS servers for VPN clients."
     echo -e "  ${DIM}(Enter two numbers separated by space, or one number for both primary/secondary)${NC}"
     echo ""
-    echo -e "  ${BOLD}1)${NC} Server's Internal DNS  ${DIM}(127.0.0.1)${NC}"
+    echo -e "  ${BOLD}1)${NC} Server's Internal DNS  ${DIM}(auto-detected)${NC}"
     echo -e "  ${BOLD}2)${NC} Cloudflare             ${DIM}(1.1.1.1, 1.0.0.1)${NC}"
     echo -e "  ${BOLD}3)${NC} AdGuard                ${DIM}(94.140.14.14, 94.140.15.15)${NC}"
     echo -e "  ${BOLD}4)${NC} Google                 ${DIM}(8.8.8.8, 8.8.4.4)${NC}"
@@ -3896,6 +3941,13 @@ change_dns_menu() {
         SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $2}')
     else
         SETUP_DNS2=$(echo "$dns2_pair" | awk '{print $1}')
+    fi
+
+    # If internal DNS selected but detection failed, fall back to Cloudflare
+    if { [ "$d1" = "1" ] || [ "$d2" = "1" ]; } && [ -z "$SETUP_DNS1" ]; then
+        print_warning "Could not detect system DNS. Falling back to Cloudflare (1.1.1.1)."
+        SETUP_DNS1="1.1.1.1"
+        SETUP_DNS2="1.0.0.1"
     fi
 
     echo ""
