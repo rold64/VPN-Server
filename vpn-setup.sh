@@ -1477,6 +1477,7 @@ configure_ikev2_firewall() {
 add_ikev2_user() {
     local username="$1"
     local password="$2"
+    local skip_restart="${3:-false}"  # pass "true" in batch ops; caller restarts once at the end
 
     print_step "Adding IKEv2 user: ${username}..."
 
@@ -1514,7 +1515,9 @@ conn ikev2-cert-${username}
 CERT_CONN
 
     # Restart strongSwan — ipsec reload does not reload secrets from disk
-    ipsec restart &>/dev/null || true
+    if [ "$skip_restart" != "true" ]; then
+        ipsec restart &>/dev/null || true
+    fi
 
     print_success "IKEv2 user added: ${username}"
 }
@@ -1522,6 +1525,7 @@ CERT_CONN
 # Remove a user from IKEv2
 remove_ikev2_user() {
     local username="$1"
+    local skip_restart="${2:-false}"
 
     print_step "Removing IKEv2 user: ${username}..."
 
@@ -1540,7 +1544,9 @@ remove_ikev2_user() {
     # Remove per-user cert connection block from ipsec.conf
     sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
 
-    ipsec restart &>/dev/null || true
+    if [ "$skip_restart" != "true" ]; then
+        ipsec restart &>/dev/null || true
+    fi
     print_success "IKEv2 user removed: ${username}"
 }
 
@@ -2263,6 +2269,7 @@ create_vpn_user() {
     local username="$1"
     local password="$2"
     local psk="$3"
+    local skip_restart="${4:-false}"
 
     print_section "Creating VPN User: ${username}"
 
@@ -2271,7 +2278,7 @@ create_vpn_user() {
 
     # Add to each installed VPN
     if vpn_is_installed "$VPN_IKEV2"; then
-        add_ikev2_user "$username" "$password"
+        add_ikev2_user "$username" "$password" "$skip_restart"
     fi
 
     if vpn_is_installed "$VPN_L2TP"; then
@@ -3266,7 +3273,7 @@ batch_add_interactive() {
             fi
         done
 
-        create_vpn_user "$new_username" "$new_password" "$new_psk"
+        create_vpn_user "$new_username" "$new_password" "$new_psk" "true"
         ((total_created++))
 
         echo ""
@@ -3275,6 +3282,12 @@ batch_add_interactive() {
         fi
         echo ""
     done
+
+    # Single restart after all users are written
+    if [ "$total_created" -gt 0 ] && vpn_is_installed "$VPN_IKEV2"; then
+        print_step "Restarting strongSwan..."
+        ipsec restart &>/dev/null || true
+    fi
 
     echo ""
     print_info "Batch add complete: ${total_created} user(s) created."
@@ -3374,17 +3387,23 @@ batch_add_from_csv() {
         fi
     fi
 
-    # Phase 3 — create
+    # Phase 3 — create (skip per-user restart; restart once at the end)
     local created=0 failed=0
     local i
     for i in "${!valid_users[@]}"; do
-        if create_vpn_user "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}"; then
+        if create_vpn_user "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}" "true"; then
             ((created++))
         else
             print_error "Failed to create user '${valid_users[$i]}'"
             ((failed++))
         fi
     done
+
+    # Single restart after all users are written
+    if [ "$created" -gt 0 ] && vpn_is_installed "$VPN_IKEV2"; then
+        print_step "Restarting strongSwan..."
+        ipsec restart &>/dev/null || true
+    fi
 
     echo ""
     print_info "Import complete: ${created} created, ${failed} failed."
@@ -3505,6 +3524,7 @@ update_user_credentials() {
     local username="$1"
     local new_password="$2"
     local new_psk="$3"
+    local skip_restart="${4:-false}"  # pass "true" in batch ops; caller restarts once at the end
 
     print_section "Updating credentials for: ${username}"
 
@@ -3545,15 +3565,16 @@ update_user_credentials() {
         # Regenerate all profile files
         generate_all_profiles "$username" "$new_password" "$effective_psk"
 
-        # Restart strongSwan to reload secrets from disk
-        if vpn_is_installed "$VPN_IKEV2"; then
-            ipsec restart 2>/dev/null || true
-        fi
-        if vpn_is_installed "$VPN_L2TP"; then
-            service_restart xl2tpd
-        fi
-        if vpn_is_installed "$VPN_OVPN"; then
-            service_restart openvpn@server
+        if [ "$skip_restart" != "true" ]; then
+            if vpn_is_installed "$VPN_IKEV2"; then
+                ipsec restart 2>/dev/null || true
+            fi
+            if vpn_is_installed "$VPN_L2TP"; then
+                service_restart xl2tpd
+            fi
+            if vpn_is_installed "$VPN_OVPN"; then
+                service_restart openvpn@server
+            fi
         fi
 
         print_success "Password updated."
@@ -3590,7 +3611,7 @@ update_user_credentials() {
             done <<< "$all_users"
         fi
 
-        if vpn_is_installed "$VPN_IKEV2"; then
+        if [ "$skip_restart" != "true" ] && vpn_is_installed "$VPN_IKEV2"; then
             ipsec restart 2>/dev/null || true
         fi
 
@@ -3683,17 +3704,31 @@ batch_update_from_csv() {
         fi
     fi
 
-    # Phase 3 — apply
+    # Phase 3 — apply (skip per-user restart; restart once at the end)
     local updated=0 failed=0
     local i
     for i in "${!valid_users[@]}"; do
-        if update_user_credentials "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}"; then
+        if update_user_credentials "${valid_users[$i]}" "${valid_passes[$i]}" "${valid_psks[$i]}" "true"; then
             ((updated++))
         else
             print_error "Failed to update user '${valid_users[$i]}'"
             ((failed++))
         fi
     done
+
+    # Single restart after all credentials are written
+    if [ "$updated" -gt 0 ]; then
+        if vpn_is_installed "$VPN_IKEV2"; then
+            print_step "Restarting strongSwan..."
+            ipsec restart 2>/dev/null || true
+        fi
+        if vpn_is_installed "$VPN_L2TP"; then
+            service_restart xl2tpd
+        fi
+        if vpn_is_installed "$VPN_OVPN"; then
+            service_restart openvpn@server
+        fi
+    fi
 
     echo ""
     print_info "Bulk update complete: ${updated} updated, ${failed} failed."
