@@ -1513,8 +1513,8 @@ conn ikev2-cert-${username}
 # END ikev2-cert-${username}
 CERT_CONN
 
-    # Reload strongSwan
-    ipsec reload &>/dev/null || ipsec restart &>/dev/null || true
+    # Restart strongSwan — ipsec reload does not reload secrets from disk
+    ipsec restart &>/dev/null || true
 
     print_success "IKEv2 user added: ${username}"
 }
@@ -1540,7 +1540,7 @@ remove_ikev2_user() {
     # Remove per-user cert connection block from ipsec.conf
     sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
 
-    ipsec reload &>/dev/null || true
+    ipsec restart &>/dev/null || true
     print_success "IKEv2 user removed: ${username}"
 }
 
@@ -1707,7 +1707,7 @@ L2TP_CONN
         sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
     fi
 
-    ipsec reload &>/dev/null || true
+    ipsec restart &>/dev/null || true
     print_success "L2TP/IPsec connection configured."
 }
 
@@ -3545,9 +3545,9 @@ update_user_credentials() {
         # Regenerate all profile files
         generate_all_profiles "$username" "$new_password" "$effective_psk"
 
-        # Reload services
+        # Restart strongSwan to reload secrets from disk
         if vpn_is_installed "$VPN_IKEV2"; then
-            ipsec reload 2>/dev/null || true
+            ipsec restart 2>/dev/null || true
         fi
         if vpn_is_installed "$VPN_L2TP"; then
             service_restart xl2tpd
@@ -3591,7 +3591,7 @@ update_user_credentials() {
         fi
 
         if vpn_is_installed "$VPN_IKEV2"; then
-            ipsec reload 2>/dev/null || true
+            ipsec restart 2>/dev/null || true
         fi
 
         print_success "PSK updated."
