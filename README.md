@@ -28,6 +28,7 @@ Run it again at any time to add users, change settings, or manage your VPN serve
 - 📱 **Ready-to-import profiles** — generates `.mobileconfig` (Apple), `.sswan` (Android), `.ovpn` (OpenVPN), `.conf` (WireGuard), and `.ps1` (Windows) for every user
 - 🔄 **Re-run aware** — detects existing installations and presents a management menu instead of reinstalling
 - 🏗️ **Self-signed PKI** — auto-generates a full certificate authority with 10-year validity; no external CA needed
+- 🌍 **Let's Encrypt support** — when a DNS hostname is used, obtains a trusted LE certificate automatically via certbot HTTP-01; falls back to self-signed if LE fails; auto-renews via certbot's systemd timer/cron
 
 ---
 
@@ -370,7 +371,7 @@ During setup (and later via the management menu), you can push up to **two DNS s
 
 | # | Provider | IPv4 | IPv6 |
 |---|----------|------|------|
-| 1 | Server's Internal DNS | `127.0.0.1` | — |
+| 1 | Server's Internal DNS | auto-detected (real upstream, not `127.0.0.1`) | — |
 | 2 | Cloudflare | `1.1.1.1`, `1.0.0.1` | `2606:4700:4700::1111` |
 | 3 | AdGuard | `94.140.14.14`, `94.140.15.15` | `2a10:50c0::ad1:ff` |
 | 4 | Google | `8.8.8.8`, `8.8.4.4` | `2001:4860:4860::8888` |
@@ -512,9 +513,20 @@ SERVER_SUBNET_ACCESS=enabled:192.168.1.0/24
 CLIENT_SUBNET_ACCESS=disabled
 PORT_FORWARDING_RULES=tcp:8080->10.20.20.3:3000
 SETUP_DATE=2025-01-15 14:32:00
+CERT_TYPE=letsencrypt
+LE_DOMAIN=vpn.example.com
+LE_EMAIL=admin@example.com
+OPENVPN_SERVICE=openvpn@server
 ```
 
 > ⚠️ This file contains the L2TP PSK and other sensitive data. It is created with `chmod 600` and readable only by root.
+
+| Key | Values | Purpose |
+|-----|--------|---------|
+| `CERT_TYPE` | `letsencrypt` / `self-signed` | Set during install; controls profile and cert behaviour on re-run |
+| `LE_DOMAIN` | FQDN | DNS hostname that the LE cert was issued for |
+| `LE_EMAIL` | email | Address used for certbot registration / expiry notices |
+| `OPENVPN_SERVICE` | `openvpn@server` / `openvpn-server@server` | Detected at install time; `openvpn-server@server` on RHEL 8+ |
 
 </details>
 
@@ -539,8 +551,10 @@ sudo cat /var/log/syslog | grep xl2tpd
 sudo wg show
 sudo systemctl status wg-quick@wg0
 
-# OpenVPN
+# OpenVPN (Ubuntu/Debian/RHEL 7)
 sudo systemctl status openvpn@server
+# OpenVPN (RHEL 8+ / Rocky / AlmaLinux)
+sudo systemctl status openvpn-server@server
 sudo tail -f /var/log/openvpn.log
 ```
 
@@ -600,6 +614,10 @@ If you need to re-generate profile files (e.g. after changing the server address
 | IKEv2 EAP `no EAP key found for hosts 'IP' - 'user'` | Wrong EAP credential format in `ipsec.secrets` | Reinstall with latest script (`%any user : EAP "pass"` not `user : EAP "pass"`) |
 | VPN connects, can ping IPs but DNS fails (internal DNS option) | `127.0.0.1` pushed to clients resolves to client's own loopback | Reinstall with latest script; or run **Advanced → Change DNS** and re-select option 1 (now auto-detects real upstream) |
 | OpenVPN fails to start: `network must be between /64 and /124` | IPv6 tunnel subnet used `/48` prefix | Reinstall with latest script (uses `/64`); or edit `server.conf`: `server-ipv6 fddd:2c4:2c4:2c4::/64` |
+| OpenVPN fails to start: `invalid network/netmask combination` | `server` directive received CIDR notation (`10.8.0.0/24`) instead of plain network | Reinstall with latest script; or edit `server.conf`: `server 10.8.0.0 255.255.255.0` |
+| OpenVPN `Failed to start openvpn@server.service` on RHEL 8+ | RHEL 8+ uses `openvpn-server@server` unit name, not `openvpn@server` | Reinstall with latest script (auto-detects service name); or: `systemctl start openvpn-server@server` |
+| All L2TP users get "authentication failed" immediately after setup | PSK was never written to `ipsec.secrets` (grep matched header comment) | Reinstall with latest script; or manually add `%any %any : PSK "yourpsk"` to `/etc/ipsec.secrets` and run `ipsec reload` |
+| WireGuard: re-adding a user causes duplicate `[Peer]` block in `wg0.conf` | Old peer block not removed before appending new one | Reinstall with latest script; or manually remove the duplicate `[Peer]` block from `/etc/wireguard/wg0.conf` and run `systemctl restart wg-quick@wg0` |
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
@@ -671,7 +689,7 @@ The script installs only what is needed for the VPN types you select:
 <summary><strong>🏗️ Script Architecture</strong></summary>
 <br>
 
-The script is organized into logical sections within a single `vpn-setup.sh` file (~4,800 lines):
+The script is organized into logical sections within a single `vpn-setup.sh` file (~5,350 lines):
 
 ```
 vpn-setup.sh
@@ -679,34 +697,41 @@ vpn-setup.sh
 ├── Color output & UI helpers
 ├── Utility functions
 │   ├── UUID generation
-│   ├── String escaping (ipsec, PPP)
+│   ├── String escaping (escape_ipsec, escape_ppp, sed_escape_pattern, sed_escape_replacement)
 │   ├── IP increment / next-IP tracking
-│   └── iptables helpers (fw_add, fw_delete, save_iptables)
+│   ├── iptables helpers (fw_add, fw_delete, save_iptables)
+│   └── get_openvpn_svc()  — detects openvpn@server vs openvpn-server@server, cached
 ├── OS detection (apt / dnf / yum)
 ├── State management (KEY=VALUE, /etc/vpn-setup/state.conf)
-├── Setup wizard (7 interactive questions)
+├── Setup wizard (7 interactive questions + LE email when DNS hostname given)
 ├── System preparation
 │   ├── Package update
 │   ├── Dependency installation
 │   ├── IP forwarding (sysctl)
 │   └── Base iptables rules + NAT
 ├── Certificate generation (CA → server → per-user → P12)
+├── Let's Encrypt support
+│   ├── validate_dns_resolves()  — checks hostname → server IP before attempting
+│   ├── install_certbot()        — apt / dnf / yum
+│   ├── obtain_letsencrypt_cert() — certbot standalone HTTP-01, copies to CERTS_DIR
+│   ├── _write_le_deploy_hooks() — deploy/pre/post hooks under /etc/letsencrypt/renewal-hooks/
+│   └── is_letsencrypt()         — helper, reads CERT_TYPE from state
 ├── VPN installation
 │   ├── install_ikev2()     → ipsec.conf, ipsec.secrets, firewall
 │   ├── install_l2tp()      → xl2tpd.conf, ppp options, chap-secrets
 │   ├── install_wireguard() → wg0.conf, server key pair
-│   └── install_openvpn()   → server.conf, ta.key, dh.pem, verify.sh
+│   └── install_openvpn()   → server.conf, ta.key, dh.pem, verify.sh (service name auto-detected)
 ├── User management
 │   ├── create_vpn_user()   → adds to all installed VPNs
 │   ├── remove_vpn_user()   → removes from all + deletes profiles
-│   └── per-VPN add/remove functions
+│   └── per-VPN add/remove  — all credential writes use delete-before-add, sed patterns escaped
 ├── Profile generation
-│   ├── IKEv2 EAP mobileconfig (Apple)
-│   ├── IKEv2 certificate mobileconfig (Apple, with embedded P12)
+│   ├── IKEv2 EAP mobileconfig (Apple; CA payload omitted in LE mode)
+│   ├── IKEv2 certificate mobileconfig (Apple, with embedded P12; CA payload omitted in LE mode)
 │   ├── strongSwan .sswan (Android, EAP + certificate variants)
 │   ├── PowerShell setup script (Windows)
 │   ├── WireGuard .conf (with client keys embedded)
-│   ├── OpenVPN .ovpn (all certs + tls-crypt embedded)
+│   ├── OpenVPN .ovpn (LE chain or own CA in <ca> block depending on CERT_TYPE)
 │   └── Plain-text connection info
 ├── Management menu (re-run detection)
 │   ├── User management
@@ -723,6 +748,7 @@ vpn-setup.sh
 │       ├── Split tunneling
 │       ├── Subnet access
 │       ├── Port forwarding
+│       ├── Let's Encrypt renewal (shown only when CERT_TYPE=letsencrypt)
 │       └── IPv6 disable
 └── main() — detects first run vs re-run
 ```
@@ -733,6 +759,8 @@ vpn-setup.sh
 - **State-driven** — all configuration is driven from `/etc/vpn-setup/state.conf`; the script can be interrupted and re-run safely
 - **Non-destructive** — existing config files are backed up with timestamps before being overwritten
 - **Idempotent iptables** — all `fw_add` calls check with `iptables -C` before adding, preventing duplicate rules
+- **Delete-before-add credential writes** — `ipsec.secrets`, `chap-secrets`, and `users.passwd` are updated by deleting the old line then appending the new one; no `sed s|...|user_value|` patterns that could be broken by special characters in passwords
+- **sed injection safety** — all `sed` patterns that include usernames or other user-controlled data are run through `sed_escape_pattern()` to escape BRE metacharacters (`.`, `*`, `[`, `]`, etc.)
 
 </details>
 

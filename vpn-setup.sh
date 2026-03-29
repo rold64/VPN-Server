@@ -174,6 +174,21 @@ escape_ppp() {
     printf '%s' "$val"
 }
 
+# Escape a string for use as a BRE pattern in sed (not for replacements)
+# Escapes: . * [ ] ^ $ \  /
+sed_escape_pattern() {
+    printf '%s' "$1" | sed 's/[]\[.*^$\\\/]/\\&/g'
+}
+
+# Escape a string for use in the replacement part of a sed s/// command
+# (delimiter is |) — escapes: \ and |
+sed_escape_replacement() {
+    local val="$1"
+    val="${val//\\/\\\\}"
+    val="${val//|/\\|}"
+    printf '%s' "$val"
+}
+
 # Hash a password with SHA-256 for OpenVPN credentials file
 hash_password() {
     local password="$1"
@@ -537,6 +552,27 @@ service_enable() {
 service_is_active() {
     local svc="$1"
     systemctl is-active "$svc" &>/dev/null
+}
+
+# Return the correct OpenVPN systemd service name for this OS.
+# Debian/Ubuntu and RHEL 7 use openvpn@server; RHEL 8+ uses openvpn-server@server.
+# Result is cached in _OPENVPN_SVC after first call and saved to state during install.
+_OPENVPN_SVC=""
+get_openvpn_svc() {
+    if [ -n "$_OPENVPN_SVC" ]; then
+        printf '%s' "$_OPENVPN_SVC"
+        return
+    fi
+    local saved
+    saved=$(get_state "OPENVPN_SERVICE" 2>/dev/null)
+    if [ -n "$saved" ]; then
+        _OPENVPN_SVC="$saved"
+    elif systemctl cat "openvpn-server@server" &>/dev/null; then
+        _OPENVPN_SVC="openvpn-server@server"
+    else
+        _OPENVPN_SVC="openvpn@server"
+    fi
+    printf '%s' "$_OPENVPN_SVC"
 }
 
 #==============================================================================
@@ -1288,7 +1324,8 @@ if [ -d /etc/openvpn/server ]; then
     cp "${CERTS_DIR}/server.crt" /etc/openvpn/server/server.crt
     cp "${CERTS_DIR}/server.key" /etc/openvpn/server/server.key
     chmod 600 /etc/openvpn/server/server.key
-    systemctl restart openvpn@server >/dev/null 2>&1 || true
+    systemctl restart openvpn@server >/dev/null 2>&1 || \
+    systemctl restart openvpn-server@server >/dev/null 2>&1 || true
 fi
 DEPLOY_HOOK
     chmod 700 /etc/letsencrypt/renewal-hooks/deploy/vpn-cert-deploy.sh
@@ -1578,9 +1615,13 @@ configure_ikev2() {
     # Backup existing config
     [ -f /etc/ipsec.conf ] && cp /etc/ipsec.conf /etc/ipsec.conf.bak.$(date +%Y%m%d%H%M%S)
 
-    local dns_line="rightdns=${dns1}"
-    if [ -n "$dns2" ] && [ "$dns2" != "$dns1" ]; then
-        dns_line="rightdns=${dns1},${dns2}"
+    local dns_line=""
+    if [ -n "$dns1" ]; then
+        if [ -n "$dns2" ] && [ "$dns2" != "$dns1" ]; then
+            dns_line="rightdns=${dns1},${dns2}"
+        else
+            dns_line="rightdns=${dns1}"
+        fi
     fi
 
     local rightsourceip_eap="${IKEV2_POOL}"
@@ -1680,13 +1721,14 @@ add_ikev2_user() {
     print_step "Adding IKEv2 user: ${username}..."
 
     # Add EAP credentials to ipsec.secrets
-    local escaped_user escaped_pass
+    local escaped_user escaped_pass sed_user
     escaped_user=$(escape_ipsec "$username")
     escaped_pass=$(escape_ipsec "$password")
+    sed_user=$(sed_escape_pattern "$escaped_user")
 
-    # Remove existing entry if present
+    # Remove existing entry if present (delete-before-add is idempotent and re-run safe)
     # Format: "%any username : EAP ..." — %any is the server wildcard, username is the EAP client identity
-    sed -i "/^%any ${escaped_user} : EAP /d" /etc/ipsec.secrets
+    sed -i "/^%any ${sed_user} : EAP /d" /etc/ipsec.secrets
 
     echo "%any ${escaped_user} : EAP \"${escaped_pass}\"" >> /etc/ipsec.secrets
 
@@ -1702,7 +1744,9 @@ add_ikev2_user() {
     # Add per-user cert connection so certificate auth gets an exact rightid match,
     # giving it higher priority than the wildcard ikev2-eap connection.
     # Remove stale entry first, then append fresh block.
-    sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
+    local sed_uname
+    sed_uname=$(sed_escape_pattern "$username")
+    sed -i "/^# BEGIN ikev2-cert-${sed_uname}$/,/^# END ikev2-cert-${sed_uname}$/d" /etc/ipsec.conf
     cat >> /etc/ipsec.conf << CERT_CONN
 
 # BEGIN ikev2-cert-${username}
@@ -1727,20 +1771,21 @@ remove_ikev2_user() {
 
     print_step "Removing IKEv2 user: ${username}..."
 
-    # Remove EAP entry (both old format and new %any format)
-    sed -i "/^${username} : EAP /d" /etc/ipsec.secrets
-    sed -i "/^%any ${username} : EAP /d" /etc/ipsec.secrets
-    local escaped_user
+    # Remove EAP entry — cover both old (no %any prefix) and current (%any prefix) formats
+    local escaped_user sed_user
     escaped_user=$(escape_ipsec "$username")
-    sed -i "/^${escaped_user} : EAP /d" /etc/ipsec.secrets
-    sed -i "/^%any ${escaped_user} : EAP /d" /etc/ipsec.secrets
+    sed_user=$(sed_escape_pattern "$escaped_user")
+    sed -i "/^${sed_user} : EAP /d" /etc/ipsec.secrets
+    sed -i "/^%any ${sed_user} : EAP /d" /etc/ipsec.secrets
 
     # Remove certs
     rm -f "/etc/ipsec.d/certs/${username}_client.crt"
     rm -f "/etc/ipsec.d/private/${username}_client.key"
 
     # Remove per-user cert connection block from ipsec.conf
-    sed -i "/^# BEGIN ikev2-cert-${username}$/,/^# END ikev2-cert-${username}$/d" /etc/ipsec.conf
+    local sed_uname
+    sed_uname=$(sed_escape_pattern "$username")
+    sed -i "/^# BEGIN ikev2-cert-${sed_uname}$/,/^# END ikev2-cert-${sed_uname}$/d" /etc/ipsec.conf
 
     if [ "$skip_restart" != "true" ]; then
         ipsec restart &>/dev/null || true
@@ -1901,15 +1946,11 @@ conn L2TP-PSK
     esp=aes256-sha1,aes128-sha1,3des-sha1
 L2TP_CONN
 
-    # Add PSK to ipsec.secrets if not already there
+    # Write PSK to ipsec.secrets (delete-before-add so the entry is always current)
     local escaped_psk
     escaped_psk=$(escape_ipsec "$psk")
-    if ! grep -q "PSK" /etc/ipsec.secrets 2>/dev/null; then
-        echo "%any %any : PSK \"${escaped_psk}\"" >> /etc/ipsec.secrets
-    else
-        # Update existing PSK
-        sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
-    fi
+    sed -i "/^%any %any : PSK /d" /etc/ipsec.secrets
+    echo "%any %any : PSK \"${escaped_psk}\"" >> /etc/ipsec.secrets
 
     ipsec restart &>/dev/null || true
     print_success "L2TP/IPsec connection configured."
@@ -1941,12 +1982,13 @@ add_l2tp_user() {
 
     print_step "Adding L2TP user: ${username}..."
 
-    local escaped_user escaped_pass
+    local escaped_user escaped_pass sed_user
     escaped_user=$(escape_ppp "$username")
     escaped_pass=$(escape_ppp "$password")
+    sed_user=$(sed_escape_pattern "$escaped_user")
 
-    # Remove existing entry
-    sed -i "/^\"${escaped_user}\" l2tpd /d" /etc/ppp/chap-secrets
+    # Remove existing entry (delete-before-add)
+    sed -i "/^\"${sed_user}\" l2tpd /d" /etc/ppp/chap-secrets
 
     echo "\"${escaped_user}\" l2tpd \"${escaped_pass}\" *" >> /etc/ppp/chap-secrets
     chmod 600 /etc/ppp/chap-secrets
@@ -1961,8 +2003,9 @@ remove_l2tp_user() {
     escaped_user=$(escape_ppp "$username")
 
     print_step "Removing L2TP user: ${username}..."
-    sed -i "/^\"${escaped_user}\" l2tpd /d" /etc/ppp/chap-secrets
-    sed -i "/^\"${username}\" l2tpd /d" /etc/ppp/chap-secrets
+    local sed_user
+    sed_user=$(sed_escape_pattern "$escaped_user")
+    sed -i "/^\"${sed_user}\" l2tpd /d" /etc/ppp/chap-secrets
 
     service_restart "xl2tpd"
     print_success "L2TP user removed: ${username}"
@@ -2090,6 +2133,10 @@ add_wireguard_user() {
     local user_dir="${CERTS_DIR}/users/${username}"
     mkdir -p "$user_dir"
 
+    # Capture old public key BEFORE generating new ones so we can hot-remove the old peer
+    local old_pubkey=""
+    [ -f "${user_dir}/wg_client.pub" ] && old_pubkey=$(cat "${user_dir}/wg_client.pub" 2>/dev/null || true)
+
     # Generate client key pair
     local client_privkey client_pubkey
     client_privkey=$(wg genkey)
@@ -2110,6 +2157,24 @@ add_wireguard_user() {
 
     # Save client IP for profile generation
     save_state "WG_IP_${username}" "$client_ip"
+
+    # Remove any existing peer block for this user before appending fresh one
+    # (guards against duplicate entries if the user is re-added)
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        # Hot-remove old peer from running wg0 (old_pubkey was captured before key regen)
+        if [ -n "$old_pubkey" ] && wg show wg0 &>/dev/null; then
+            wg set wg0 peer "$old_pubkey" remove &>/dev/null || true
+        fi
+        python3 - "${username}" /etc/wireguard/wg0.conf << 'PYEOF_CLEAN' 2>/dev/null || true
+import sys, re
+uname = sys.argv[1]
+with open(sys.argv[2], 'r') as f:
+    content = f.read()
+content = re.sub(r'\n# User: ' + re.escape(uname) + r'\n\[Peer\][^\[]*', '', content)
+with open(sys.argv[2], 'w') as f:
+    f.write(content)
+PYEOF_CLEAN
+    fi
 
     # Add peer to server config
     cat >> /etc/wireguard/wg0.conf << WG_PEER
@@ -2207,9 +2272,12 @@ install_openvpn() {
     setup_openvpn_auth_script
     configure_openvpn_firewall
 
-    service_enable "openvpn@server"
-    service_enable "openvpn-server@server" 2>/dev/null || true
-    service_restart "openvpn@server"
+    # Detect the correct service name (RHEL 8+ uses openvpn-server@server)
+    local ovpn_svc
+    ovpn_svc=$(get_openvpn_svc)
+    save_state "OPENVPN_SERVICE" "$ovpn_svc"
+    service_enable "$ovpn_svc"
+    service_restart "$ovpn_svc"
 
     save_state "OVPN_NEXT_IP" "$OVPN_FIRST_CLIENT"
     mark_vpn_installed "$VPN_OVPN"
@@ -2267,7 +2335,9 @@ configure_openvpn() {
 push \"dhcp-option DNS ${dns2}\""
     fi
 
-    local server_directive="server ${OVPN_SUBNET} 255.255.255.0"
+    # OpenVPN 'server' directive needs plain network address without CIDR prefix
+    local ovpn_network="${OVPN_SUBNET%%/*}"
+    local server_directive="server ${ovpn_network} 255.255.255.0"
     local ipv6_directives=""
     if [ "$ipv6_enabled" = "yes" ]; then
         ipv6_directives="
@@ -2412,8 +2482,10 @@ add_openvpn_user() {
     local pass_hash
     pass_hash=$(hash_password "$password")
 
-    # Remove existing entry
-    sed -i "/^${username}:/d" "${OPENVPN_DIR}/auth/users.passwd"
+    # Remove existing entry (delete-before-add)
+    local sed_uname
+    sed_uname=$(sed_escape_pattern "$username")
+    sed -i "/^${sed_uname}:/d" "${OPENVPN_DIR}/auth/users.passwd"
 
     echo "${username}:${pass_hash}" >> "${OPENVPN_DIR}/auth/users.passwd"
     chown root:nogroup "${OPENVPN_DIR}/auth/users.passwd"
@@ -2434,7 +2506,7 @@ add_openvpn_user() {
         echo "client-config-dir ${OPENVPN_DIR}/ccd" >> "${OPENVPN_DIR}/server.conf"
     fi
 
-    service_restart "openvpn@server"
+    service_restart "$(get_openvpn_svc)"
     print_success "OpenVPN user added: ${username} (IP: ${client_ip})"
 }
 
@@ -2444,7 +2516,9 @@ remove_openvpn_user() {
     print_step "Removing OpenVPN user: ${username}..."
 
     # Remove from credentials file
-    sed -i "/^${username}:/d" "${OPENVPN_DIR}/auth/users.passwd"
+    local sed_uname
+    sed_uname=$(sed_escape_pattern "$username")
+    sed -i "/^${sed_uname}:/d" "${OPENVPN_DIR}/auth/users.passwd"
 
     # Remove CCD file
     rm -f "${OPENVPN_DIR}/ccd/${username}"
@@ -2456,7 +2530,7 @@ remove_openvpn_user() {
         print_info "For full revocation, consider regenerating the CA or implementing a CRL."
     fi
 
-    service_restart "openvpn@server"
+    service_restart "$(get_openvpn_svc)"
     print_success "OpenVPN user removed: ${username}"
 }
 #==============================================================================
@@ -3808,27 +3882,33 @@ update_user_credentials() {
     if [ -n "$new_password" ]; then
         print_step "Updating password..."
 
-        # IKEv2 EAP in ipsec.secrets
+        # IKEv2 EAP in ipsec.secrets — delete-before-add avoids sed delimiter conflicts
         if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.secrets ]; then
-            local escaped_user escaped_pass
+            local escaped_user escaped_pass sed_user
             escaped_user=$(escape_ipsec "$username")
             escaped_pass=$(escape_ipsec "$new_password")
-            sed -i "s|^%any ${escaped_user} : EAP .*|%any ${escaped_user} : EAP \"${escaped_pass}\"|" /etc/ipsec.secrets
+            sed_user=$(sed_escape_pattern "$escaped_user")
+            sed -i "/^%any ${sed_user} : EAP /d" /etc/ipsec.secrets
+            echo "%any ${escaped_user} : EAP \"${escaped_pass}\"" >> /etc/ipsec.secrets
         fi
 
-        # L2TP PPP in chap-secrets
+        # L2TP PPP in chap-secrets — delete-before-add
         if vpn_is_installed "$VPN_L2TP" && [ -f /etc/ppp/chap-secrets ]; then
-            local ppp_user ppp_pass
+            local ppp_user ppp_pass sed_ppp_user
             ppp_user=$(escape_ppp "$username")
             ppp_pass=$(escape_ppp "$new_password")
-            sed -i "s|^\"${ppp_user}\" l2tpd .*|\"${ppp_user}\" l2tpd \"${ppp_pass}\" *|" /etc/ppp/chap-secrets
+            sed_ppp_user=$(sed_escape_pattern "$ppp_user")
+            sed -i "/^\"${sed_ppp_user}\" l2tpd /d" /etc/ppp/chap-secrets
+            echo "\"${ppp_user}\" l2tpd \"${ppp_pass}\" *" >> /etc/ppp/chap-secrets
         fi
 
-        # OpenVPN SHA-256 hash in users.passwd
+        # OpenVPN SHA-256 hash in users.passwd — delete-before-add
         if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/auth/users.passwd" ]; then
-            local new_hash
+            local new_hash sed_uname
             new_hash=$(hash_password "$new_password")
-            sed -i "s|^${username}:.*|${username}:${new_hash}|" "${OPENVPN_DIR}/auth/users.passwd"
+            sed_uname=$(sed_escape_pattern "$username")
+            sed -i "/^${sed_uname}:/d" "${OPENVPN_DIR}/auth/users.passwd"
+            echo "${username}:${new_hash}" >> "${OPENVPN_DIR}/auth/users.passwd"
         fi
 
         # Regenerate client cert (P12 export password = VPN password)
@@ -3845,7 +3925,7 @@ update_user_credentials() {
                 service_restart xl2tpd
             fi
             if vpn_is_installed "$VPN_OVPN"; then
-                service_restart openvpn@server
+                service_restart "$(get_openvpn_svc)"
             fi
         fi
 
@@ -3858,18 +3938,13 @@ update_user_credentials() {
 
         save_state "L2TP_PSK" "$new_psk"
 
-        # Update ipsec.secrets PSK line if IKEv2 is installed
-        if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.secrets ]; then
+        # Update ipsec.secrets PSK line (used by both IKEv2 and L2TP)
+        if { vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; } && [ -f /etc/ipsec.secrets ]; then
             local escaped_psk
             escaped_psk=$(escape_ipsec "$new_psk")
-            sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
-        fi
-
-        # Update xl2tpd/ipsec L2TP PSK if L2TP installed
-        if vpn_is_installed "$VPN_L2TP" && [ -f /etc/ipsec.secrets ]; then
-            local escaped_psk
-            escaped_psk=$(escape_ipsec "$new_psk")
-            sed -i "s|^%any %any : PSK .*|%any %any : PSK \"${escaped_psk}\"|" /etc/ipsec.secrets
+            # Delete-before-add: avoids sed delimiter conflicts with special chars in PSK
+            sed -i "/^%any %any : PSK /d" /etc/ipsec.secrets
+            echo "%any %any : PSK \"${escaped_psk}\"" >> /etc/ipsec.secrets
         fi
 
         print_warning "L2TP PSK is server-wide — all existing L2TP clients need updated profiles."
@@ -3998,7 +4073,7 @@ batch_update_from_csv() {
             service_restart xl2tpd
         fi
         if vpn_is_installed "$VPN_OVPN"; then
-            service_restart openvpn@server
+            service_restart "$(get_openvpn_svc)"
         fi
     fi
 
@@ -4234,7 +4309,7 @@ change_server_address_menu() {
 
     # Restart OpenVPN
     if vpn_is_installed "$VPN_OVPN"; then
-        service_restart "openvpn@server"
+        service_restart "$(get_openvpn_svc)"
     fi
 
     # Regenerate all user profiles with new address
@@ -4329,13 +4404,19 @@ change_dns_menu() {
 
     # Update OpenVPN
     if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
-        sed -i "s|^push \"dhcp-option DNS .*|push \"dhcp-option DNS ${SETUP_DNS1}\"|" "${OPENVPN_DIR}/server.conf"
-        service_restart "openvpn@server"
+        if [ -n "$SETUP_DNS1" ]; then
+            sed -i "s|^push \"dhcp-option DNS .*|push \"dhcp-option DNS ${SETUP_DNS1}\"|" "${OPENVPN_DIR}/server.conf"
+        fi
+        service_restart "$(get_openvpn_svc)"
     fi
 
     # Update IKEv2 (rightdns in ipsec.conf)
     if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.conf ]; then
-        sed -i "s|rightdns=.*|rightdns=${SETUP_DNS1},${SETUP_DNS2}|" /etc/ipsec.conf
+        if [ -n "$SETUP_DNS1" ]; then
+            local new_dns_val="${SETUP_DNS1}"
+            [ -n "$SETUP_DNS2" ] && [ "$SETUP_DNS2" != "$SETUP_DNS1" ] && new_dns_val="${SETUP_DNS1},${SETUP_DNS2}"
+            sed -i "s|rightdns=.*|rightdns=${new_dns_val}|" /etc/ipsec.conf
+        fi
         service_restart "strongswan"
     fi
 
@@ -4392,7 +4473,7 @@ update_vpn_menu() {
         wg-quick up wg0 2>/dev/null || true
     fi
     if vpn_is_installed "$VPN_OVPN"; then
-        service_restart "openvpn@server"
+        service_restart "$(get_openvpn_svc)"
     fi
 
     print_success "VPN servers updated and restarted."
@@ -4516,7 +4597,7 @@ uninstall_wireguard() {
 
 uninstall_openvpn() {
     print_step "Uninstalling OpenVPN..."
-    service_stop "openvpn@server"
+    service_stop "$(get_openvpn_svc)"
     service_stop "openvpn-server@server" 2>/dev/null || true
     eval "$PKG_REMOVE openvpn" 2>/dev/null || true
     rm -rf "${OPENVPN_DIR}/server" "${OPENVPN_DIR}/auth" "${OPENVPN_DIR}/ccd"
@@ -4668,7 +4749,7 @@ apply_split_tunneling() {
                 echo "push \"route ${net} ${mask}\"" >> "${OPENVPN_DIR}/server.conf"
             done
         fi
-        service_restart "openvpn@server"
+        service_restart "$(get_openvpn_svc)"
         print_success "OpenVPN split tunneling configured."
     fi
 
@@ -5083,7 +5164,7 @@ IPV6_SYSCTL
     if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
         sed -i '/server-ipv6/d' "${OPENVPN_DIR}/server.conf"
         sed -i '/route-ipv6/d' "${OPENVPN_DIR}/server.conf"
-        service_restart "openvpn@server"
+        service_restart "$(get_openvpn_svc)"
     fi
 
     # Flush ip6tables
@@ -5216,7 +5297,7 @@ print_final_summary() {
     fi
     if vpn_is_installed "$VPN_OVPN"; then
         local ovpn_status
-        ovpn_status=$(systemctl is-active openvpn@server 2>/dev/null || echo "unknown")
+        ovpn_status=$(systemctl is-active "$(get_openvpn_svc)" 2>/dev/null || echo "unknown")
         echo -e "    OpenVPN     : ${ovpn_status}"
     fi
 
