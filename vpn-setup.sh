@@ -1204,10 +1204,22 @@ obtain_letsencrypt_cert() {
 
     install_certbot || { print_error "Failed to install certbot."; return 1; }
 
+    # If a cert already exists for a DIFFERENT domain under the vpn-server cert name,
+    # certbot --non-interactive will refuse to replace it without --force-renewal.
+    # Detect this and add the flag so the cert is replaced rather than erroring out.
+    local force_renewal=""
+    local existing_le_domain
+    existing_le_domain=$(get_state "LE_DOMAIN")
+    if [ -n "$existing_le_domain" ] && [ "$existing_le_domain" != "$domain" ]; then
+        print_warning "Replacing existing LE cert (was for '${existing_le_domain}', now '${domain}')."
+        force_renewal="--force-renewal"
+    fi
+
     # Temporarily open port 80 for HTTP-01 challenge
     iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
     ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
 
+    # shellcheck disable=SC2086
     certbot certonly \
         --standalone \
         --non-interactive \
@@ -1215,6 +1227,7 @@ obtain_letsencrypt_cert() {
         --email "$email" \
         -d "$domain" \
         --cert-name "vpn-server" \
+        $force_renewal \
         2>&1 | tee /tmp/certbot_output.log
 
     local certbot_status=${PIPESTATUS[0]}
@@ -1297,6 +1310,19 @@ POST_HOOK
     chmod 700 /etc/letsencrypt/renewal-hooks/post/vpn-close-port80.sh
 
     print_success "Let's Encrypt renewal hooks installed."
+}
+
+_cleanup_letsencrypt() {
+    # Removes the certbot certificate and renewal hooks when switching away from LE.
+    # Without this, certbot's auto-renewal would keep renewing the old cert and the
+    # deploy hook would overwrite whatever new cert is in place (self-signed or new LE).
+    print_step "Removing Let's Encrypt certificate and renewal hooks..."
+    if command -v certbot >/dev/null 2>&1; then
+        certbot delete --cert-name vpn-server --non-interactive 2>/dev/null || true
+    fi
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/vpn-cert-deploy.sh
+    rm -f /etc/letsencrypt/renewal-hooks/pre/vpn-open-port80.sh
+    rm -f /etc/letsencrypt/renewal-hooks/post/vpn-close-port80.sh
 }
 
 #==============================================================================
@@ -4161,8 +4187,18 @@ change_server_address_menu() {
         fi
     fi
 
+    # Capture current cert mode BEFORE updating state — used for LE cleanup decisions below.
+    local was_letsencrypt=false
+    is_letsencrypt && was_letsencrypt=true
+
     save_state "SERVER_ADDRESS" "$new_addr"
     save_state "ADDRESS_TYPE" "$new_type"
+
+    # Switching to IP mode: purge LE cert + hooks so auto-renewal can't overwrite the
+    # new self-signed cert after we switch away.
+    if [ "$was_letsencrypt" = "true" ] && [ "$new_type" = "ip" ]; then
+        _cleanup_letsencrypt
+    fi
 
     # Regenerate server cert for new address
     print_step "Regenerating server certificate..."
@@ -4171,6 +4207,11 @@ change_server_address_menu() {
     else
         if [ "$new_type" = "dns" ]; then
             print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
+            # Purge old LE cert + hooks so auto-renewal can't silently revert the server
+            # back to the previous domain's cert after we fall back to self-signed.
+            if [ "$was_letsencrypt" = "true" ]; then
+                _cleanup_letsencrypt
+            fi
         fi
         generate_server_cert "$new_addr" "$new_type"
         save_state "CERT_TYPE" "self-signed"
