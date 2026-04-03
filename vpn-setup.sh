@@ -46,8 +46,9 @@ SCRIPT_NAME="VPN Server Setup"
 #  §30  Advanced: access VPN clients from subnet          ~line 4983
 #  §31  Advanced: port forwarding to VPN clients          ~line 5044
 #  §32  Advanced: disable IPv6                            ~line 5217
-#  §33  First run setup orchestrator                      ~line 5285
-#  §34  Main entry point                                  ~line 5433
+#  §33  Post-install validation                           ~line 5390
+#  §34  First run setup orchestrator                      ~line 5630
+#  §35  Main entry point                                  ~line 5770
 #==============================================================================
 
 #==============================================================================
@@ -57,7 +58,7 @@ SCRIPT_NAME="VPN Server Setup"
 STATE_DIR="/etc/vpn-setup"
 STATE_FILE="${STATE_DIR}/state.conf"
 CERTS_DIR="${STATE_DIR}/certs"
-PROFILES_BASE="/etc/VPN User Profiles"
+PROFILES_BASE="/etc/vpn-profiles"
 OPENVPN_DIR="/etc/openvpn"
 LE_CERTS_BASE="/etc/letsencrypt/live"
 
@@ -209,9 +210,10 @@ escape_ipsec() {
 }
 
 # Escape a string for use in chap-secrets quoted values
-# Escapes: " → \"
+# Escapes: \ → \\  and  " → \"
 escape_ppp() {
     local val="$1"
+    val="${val//\\/\\\\}"
     val="${val//\"/\\\"}"
     printf '%s' "$val"
 }
@@ -223,10 +225,11 @@ sed_escape_pattern() {
 }
 
 # Escape a string for use in the replacement part of a sed s/// command
-# (delimiter is |) — escapes: \ and |
+# (delimiter is |) — escapes: \  &  and |
 sed_escape_replacement() {
     local val="$1"
     val="${val//\\/\\\\}"
+    val="${val//&/\\&}"
     val="${val//|/\\|}"
     printf '%s' "$val"
 }
@@ -934,10 +937,12 @@ ask_server_address() {
                 while true; do
                     echo -en "${YELLOW}  ?${NC}  Enter DNS hostname: "
                     read -r SETUP_ADDRESS
-                    if [ -n "$SETUP_ADDRESS" ]; then
-                        break
-                    else
+                    if [ -z "$SETUP_ADDRESS" ]; then
                         print_warning "  Hostname cannot be empty."
+                    elif ! echo "$SETUP_ADDRESS" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
+                        print_warning "  Invalid hostname. Use only letters, digits, dots, and hyphens."
+                    else
+                        break
                     fi
                 done
                 echo ""
@@ -1032,10 +1037,18 @@ ask_dns_servers() {
     fi
 
     # If internal DNS selected but detection failed, fall back to Cloudflare
-    if { [ "$d1" = "1" ] || [ "$d2" = "1" ]; } && [ -z "$SETUP_DNS1" ]; then
-        print_warning "  Could not detect system DNS. Falling back to Cloudflare (1.1.1.1)."
-        SETUP_DNS1="1.1.1.1"
-        SETUP_DNS2="1.0.0.1"
+    if { [ "$d1" = "1" ] || [ "$d2" = "1" ]; }; then
+        if [ -z "$SETUP_DNS1" ] && [ -z "$SETUP_DNS2" ]; then
+            print_warning "  Could not detect system DNS. Falling back to Cloudflare (1.1.1.1)."
+            SETUP_DNS1="1.1.1.1"
+            SETUP_DNS2="1.0.0.1"
+        elif [ -z "$SETUP_DNS1" ]; then
+            print_warning "  Could not detect system DNS for primary. Using Cloudflare (1.1.1.1)."
+            SETUP_DNS1="1.1.1.1"
+        elif [ -z "$SETUP_DNS2" ]; then
+            print_warning "  Could not detect system DNS for secondary. Using Cloudflare (1.0.0.1)."
+            SETUP_DNS2="1.0.0.1"
+        fi
     fi
 
     if [ "$SETUP_IPV6" = "yes" ]; then
@@ -1173,7 +1186,7 @@ install_base_dependencies() {
 }
 
 install_epel() {
-    if is_rhel_based && ! cmd_exists epel-release 2>/dev/null; then
+    if is_rhel_based && ! rpm -q epel-release &>/dev/null; then
         print_step "Installing EPEL repository..."
         case "$OS_ID" in
             centos|rhel)
@@ -1486,7 +1499,7 @@ generate_server_cert() {
     local ca_crt="${CERTS_DIR}/ca.crt"
     local san_ext="${CERTS_DIR}/server_san.ext"
 
-    # Build SAN extension
+    # Build SAN extension — include keyUsage and EKU (required by OpenVPN remote-cert-tls server)
     if [ "$addr_type" = "dns" ]; then
         cat > "$san_ext" << EXT_EOF
 [req]
@@ -1494,6 +1507,8 @@ distinguished_name = req_distinguished_name
 req_extensions = v3_req
 [req_distinguished_name]
 [v3_req]
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 [alt_names]
 DNS.1 = ${server_addr}
@@ -1506,6 +1521,8 @@ distinguished_name = req_distinguished_name
 req_extensions = v3_req
 [req_distinguished_name]
 [v3_req]
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 [alt_names]
 IP.1 = ${server_addr}
@@ -1564,7 +1581,7 @@ generate_client_cert() {
     # Generate client private key
     openssl genrsa -out "$client_key" 2048 2>/dev/null || {
         print_error "Failed to generate client key for ${username}."
-        exit 1
+        return 1
     }
     chmod 600 "$client_key"
 
@@ -1573,7 +1590,7 @@ generate_client_cert() {
         -key "$client_key" \
         -out "$client_csr" \
         -subj "/C=US/ST=VPN/L=VPN/O=VPN Client/CN=${username}" \
-        2>/dev/null || { print_error "Failed to generate client CSR."; exit 1; }
+        2>/dev/null || { print_error "Failed to generate client CSR."; return 1; }
 
     # Write extensions file (extfile approach for OpenSSL 3.x compatibility)
     # SAN email identity must match LocalIdentifier used in the IKEv2 cert mobileconfig
@@ -1596,7 +1613,7 @@ EXT_EOF
         -sha256 \
         -extfile "$client_ext" \
         -extensions v3_client \
-        2>/dev/null || { print_error "Failed to sign client certificate."; exit 1; }
+        2>/dev/null || { print_error "Failed to sign client certificate."; return 1; }
 
     rm -f "$client_ext"
 
@@ -1608,7 +1625,7 @@ EXT_EOF
         -out "$client_p12" \
         -passout "pass:${password}" \
         -name "${username} VPN Certificate" \
-        2>/dev/null || { print_error "Failed to export P12 for ${username}."; exit 1; }
+        2>/dev/null || { print_error "Failed to export P12 for ${username}."; return 1; }
 
     chmod 600 "$client_p12"
     print_success "Client certificate and P12 generated for: ${username}"
@@ -1694,6 +1711,10 @@ configure_ikev2() {
 
     local rightsourceip_eap="${IKEV2_POOL}"
     local rightsourceip_cert="10.10.11.10-10.10.11.250"
+    local leftsubnet_val="0.0.0.0/0"
+    if [ "$ipv6_enabled" = "yes" ]; then
+        leftsubnet_val="0.0.0.0/0,::/0"
+    fi
 
     cat > /etc/ipsec.conf << IPSEC_CONF
 # /etc/ipsec.conf - VPN Server IKEv2 Configuration
@@ -1710,7 +1731,7 @@ conn %default
     leftid=$([ "$addr_type" = "dns" ] && echo "@${server_addr}" || echo "${server_addr}")
     leftcert=server.crt
     leftsendcert=always
-    leftsubnet=0.0.0.0/0
+    leftsubnet=${leftsubnet_val}
     dpdaction=clear
     dpddelay=300s
     rekey=no
@@ -2223,7 +2244,10 @@ add_wireguard_user() {
 
     # Assign IP
     local client_ip
-    client_ip=$(next_wg_ip)
+    client_ip=$(next_wg_ip) || {
+        print_error "Cannot assign WireGuard IP for ${username}."
+        return 1
+    }
     save_state "WG_NEXT_IP" "$(increment_ip "$client_ip")"
 
     # Save client IP for profile generation
@@ -2482,12 +2506,15 @@ OVPN_CONF
 setup_openvpn_auth_script() {
     print_step "Setting up OpenVPN authentication script..."
     mkdir -p "${OPENVPN_DIR}/auth"
-    chown root:nogroup "${OPENVPN_DIR}/auth"
+    # OpenVPN drops privs to nobody:nogroup (Debian) or nobody:nobody (RHEL)
+    local ovpn_group="nogroup"
+    is_rhel_based && ovpn_group="nobody"
+    chown "root:${ovpn_group}" "${OPENVPN_DIR}/auth"
     chmod 750 "${OPENVPN_DIR}/auth"
 
     # Create empty credentials file — must be readable by nobody/nogroup (OpenVPN drops privs)
     touch "${OPENVPN_DIR}/auth/users.passwd"
-    chown root:nogroup "${OPENVPN_DIR}/auth/users.passwd"
+    chown "root:${ovpn_group}" "${OPENVPN_DIR}/auth/users.passwd"
     chmod 640 "${OPENVPN_DIR}/auth/users.passwd"
 
     # Create verify script
@@ -2512,8 +2539,8 @@ fi
 # Compute SHA-256 hash of provided password
 INPUT_HASH=$(printf '%s' "$PASSWORD" | sha256sum | awk '{print $1}')
 
-# Look up stored hash
-STORED_HASH=$(grep -F "^${USERNAME}:" "$CREDS_FILE" 2>/dev/null | cut -d: -f2 | head -1)
+# Look up stored hash — use awk for exact field match (grep -F can't anchor)
+STORED_HASH=$(awk -F: -v user="$USERNAME" '$1 == user {print $2; exit}' "$CREDS_FILE" 2>/dev/null)
 
 if [ -z "$STORED_HASH" ]; then
     exit 1
@@ -2564,12 +2591,17 @@ add_openvpn_user() {
     sed -i "/^${sed_uname}:/d" "${OPENVPN_DIR}/auth/users.passwd"
 
     echo "${username}:${pass_hash}" >> "${OPENVPN_DIR}/auth/users.passwd"
-    chown root:nogroup "${OPENVPN_DIR}/auth/users.passwd"
+    local ovpn_group="nogroup"
+    is_rhel_based && ovpn_group="nobody"
+    chown "root:${ovpn_group}" "${OPENVPN_DIR}/auth/users.passwd"
     chmod 640 "${OPENVPN_DIR}/auth/users.passwd"
 
     # Assign IP (tracked in state)
     local client_ip
-    client_ip=$(next_ovpn_ip)
+    client_ip=$(next_ovpn_ip) || {
+        print_error "Cannot assign OpenVPN IP for ${username}."
+        return 1
+    }
     save_state "OVPN_IP_${username}" "$client_ip"
     save_state "OVPN_NEXT_IP" "$(increment_ip "$client_ip")"
 
@@ -2624,7 +2656,10 @@ create_vpn_user() {
     print_section "Creating VPN User: ${username}"
 
     # Generate client certificate (used by IKEv2 cert-auth and OpenVPN)
-    generate_client_cert "$username" "$password"
+    generate_client_cert "$username" "$password" || {
+        print_error "Failed to generate client certificate for ${username}. Aborting user creation."
+        return 1
+    }
 
     # Add to each installed VPN
     if vpn_is_installed "$VPN_IKEV2"; then
@@ -3576,6 +3611,8 @@ add_user_menu() {
         [ "$new_username" = "0" ] && return
         if [ -z "$new_username" ]; then
             print_warning "Username cannot be empty."
+        elif ! echo "$new_username" | grep -qE '^[a-zA-Z0-9._@-]+$'; then
+            print_warning "Username may only contain letters, digits, '.', '_', '@', '-'."
         elif in_list "$new_username" "$(get_state "USERS_LIST")"; then
             print_warning "User '${new_username}' already exists."
         else
@@ -4316,8 +4353,13 @@ change_server_address_menu() {
                 while true; do
                     echo -en "${YELLOW}  ?${NC}  Enter new DNS hostname: "
                     read -r new_addr
-                    [ -n "$new_addr" ] && break
-                    print_warning "Hostname cannot be empty."
+                    if [ -z "$new_addr" ]; then
+                        print_warning "Hostname cannot be empty."
+                    elif ! echo "$new_addr" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
+                        print_warning "Invalid hostname. Use only letters, digits, dots, and hyphens."
+                    else
+                        break
+                    fi
                 done
                 break
                 ;;
@@ -4386,17 +4428,31 @@ change_server_address_menu() {
 
     # Regenerate server cert for new address
     print_step "Regenerating server certificate..."
-    if [ "$new_type" = "dns" ] && obtain_letsencrypt_cert "$new_addr" "$le_email"; then
-        true  # LE cert obtained; obtain_letsencrypt_cert already saved CERT_TYPE=letsencrypt
-    else
-        if [ "$new_type" = "dns" ]; then
-            print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
-            # Purge old LE cert + hooks so auto-renewal can't silently revert the server
-            # back to the previous domain's cert after we fall back to self-signed.
-            if [ "$was_letsencrypt" = "true" ]; then
-                _cleanup_letsencrypt
+    if [ "$new_type" = "dns" ]; then
+        if obtain_letsencrypt_cert "$new_addr" "$le_email"; then
+            true  # LE cert obtained; obtain_letsencrypt_cert already saved CERT_TYPE=letsencrypt
+        else
+            echo ""
+            print_warning "Let's Encrypt certificate could not be obtained."
+            print_warning "Common causes: port 80 blocked, DNS not pointing here, another service on port 80."
+            echo ""
+            if ask_yn "Continue with a self-signed certificate instead?" "y"; then
+                # Purge old LE cert + hooks so auto-renewal can't silently revert the server
+                # back to the previous domain's cert after we fall back to self-signed.
+                if [ "$was_letsencrypt" = "true" ]; then
+                    _cleanup_letsencrypt
+                fi
+                generate_server_cert "$new_addr" "$new_type"
+                save_state "CERT_TYPE" "self-signed"
+            else
+                print_warning "Server address change aborted. Reverting to previous address."
+                save_state "SERVER_ADDRESS" "$current_addr"
+                save_state "ADDRESS_TYPE" "$(get_state "ADDRESS_TYPE")"
+                press_enter
+                return
             fi
         fi
+    else
         generate_server_cert "$new_addr" "$new_type"
         save_state "CERT_TYPE" "self-signed"
     fi
@@ -4410,9 +4466,10 @@ change_server_address_menu() {
 
     # Update ipsec.conf server ID
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
-        local new_leftid
+        local new_leftid escaped_leftid
         new_leftid=$([ "$new_type" = "dns" ] && echo "@${new_addr}" || echo "${new_addr}")
-        sed -i "s|leftid=.*|leftid=${new_leftid}|" /etc/ipsec.conf 2>/dev/null || true
+        escaped_leftid=$(sed_escape_replacement "$new_leftid")
+        sed -i "s|leftid=.*|leftid=${escaped_leftid}|" /etc/ipsec.conf 2>/dev/null || true
         service_restart "strongswan"
     fi
 
@@ -4421,16 +4478,29 @@ change_server_address_menu() {
         service_restart "$(get_openvpn_svc)"
     fi
 
-    # Regenerate all user profiles with new address
+    # Regenerate user profiles that don't require the plaintext password.
+    # WireGuard configs, OpenVPN .ovpn profiles, IKEv2 EAP mobileconfigs, and
+    # connection info can all be regenerated without the password. Only the IKEv2
+    # cert mobileconfig, .sswan, and Windows PS1 embed the P12 password — those
+    # can't be regenerated here.
     print_step "Regenerating user profiles with new server address..."
     local users
     users=$(get_users_list)
     while IFS= read -r u; do
         [ -z "$u" ] && continue
-        local user_pass
-        # We don't store plaintext passwords — inform the user
-        print_warning "Profile for user '${u}' needs to be regenerated."
-        print_warning "Run: sudo $0 and use 'Add/Remove user' to re-add '${u}' or manually re-generate."
+        create_profile_dir "$u"
+        if vpn_is_installed "$VPN_IKEV2"; then
+            generate_ikev2_eap_mobileconfig "$u"
+        fi
+        if vpn_is_installed "$VPN_WG"; then
+            generate_wireguard_conf "$u"
+        fi
+        if vpn_is_installed "$VPN_OVPN"; then
+            generate_openvpn_ovpn "$u"
+        fi
+        generate_connection_info "$u" "" ""
+        print_warning "IKEv2 cert mobileconfig, .sswan, and Windows PS1 for '${u}' need the P12 password to regenerate."
+        print_warning "Use 'Update User' to set a new password, which will regenerate those profiles."
     done <<< "$users"
 
     print_success "Server address updated to: ${new_addr}"
@@ -4498,23 +4568,22 @@ change_dns_menu() {
     [ -n "$SETUP_DNS1_V6" ] && save_state "DNS1_IPV6" "$SETUP_DNS1_V6"
     [ -n "$SETUP_DNS2_V6" ] && save_state "DNS2_IPV6" "$SETUP_DNS2_V6"
 
-    # Update xl2tpd PPP options
+    # Update xl2tpd PPP options — remove all ms-dns lines and rewrite both
     if vpn_is_installed "$VPN_L2TP" && [ -f /etc/ppp/options.xl2tpd ]; then
-        sed -i "s|^ms-dns .*|ms-dns ${SETUP_DNS1}|" /etc/ppp/options.xl2tpd
-        # Update second ms-dns line if it exists
-        if grep -c "^ms-dns" /etc/ppp/options.xl2tpd 2>/dev/null | grep -q "^2$"; then
-            awk '/^ms-dns/{c++; if(c==2) print "ms-dns '"${SETUP_DNS2}"'"; else print; next} 1' \
-                /etc/ppp/options.xl2tpd > /tmp/ppp_opts_tmp && mv /tmp/ppp_opts_tmp /etc/ppp/options.xl2tpd
-        else
-            echo "ms-dns ${SETUP_DNS2}" >> /etc/ppp/options.xl2tpd
-        fi
+        sed -i '/^ms-dns /d' /etc/ppp/options.xl2tpd
+        echo "ms-dns ${SETUP_DNS1}" >> /etc/ppp/options.xl2tpd
+        echo "ms-dns ${SETUP_DNS2}" >> /etc/ppp/options.xl2tpd
         service_restart "xl2tpd"
     fi
 
-    # Update OpenVPN
+    # Update OpenVPN — delete all existing DNS push lines and rewrite
     if vpn_is_installed "$VPN_OVPN" && [ -f "${OPENVPN_DIR}/server.conf" ]; then
+        sed -i '/^push "dhcp-option DNS /d' "${OPENVPN_DIR}/server.conf"
         if [ -n "$SETUP_DNS1" ]; then
-            sed -i "s|^push \"dhcp-option DNS .*|push \"dhcp-option DNS ${SETUP_DNS1}\"|" "${OPENVPN_DIR}/server.conf"
+            echo "push \"dhcp-option DNS ${SETUP_DNS1}\"" >> "${OPENVPN_DIR}/server.conf"
+        fi
+        if [ -n "$SETUP_DNS2" ] && [ "$SETUP_DNS2" != "$SETUP_DNS1" ]; then
+            echo "push \"dhcp-option DNS ${SETUP_DNS2}\"" >> "${OPENVPN_DIR}/server.conf"
         fi
         service_restart "$(get_openvpn_svc)"
     fi
@@ -4578,8 +4647,7 @@ update_vpn_menu() {
         service_restart "xl2tpd"
     fi
     if vpn_is_installed "$VPN_WG"; then
-        wg-quick down wg0 2>/dev/null || true
-        wg-quick up wg0 2>/dev/null || true
+        service_restart "wg-quick@wg0"
     fi
     if vpn_is_installed "$VPN_OVPN"; then
         service_restart "$(get_openvpn_svc)"
@@ -4609,15 +4677,14 @@ uninstall_vpn_menu() {
     echo -e "  Select VPN to uninstall:"
     echo ""
 
-    local options=()
     local i=1
-    echo "$installed" | tr ',' '\n' | while read -r v; do
+    while IFS= read -r v; do
+        [ -z "$v" ] && continue
         echo -e "  ${BOLD}${i})${NC} ${v}"
         ((i++))
-    done
+    done <<< "$(echo "$installed" | tr ',' '\n')"
 
-    local num_installed
-    num_installed=$(echo "$installed" | tr ',' '\n' | grep -c '.' || echo 0)
+    local num_installed=$((i - 1))
     local all_num=$((num_installed + 1))
     echo -e "  ${BOLD}${all_num})${NC} All VPN servers"
     echo -e "  ${BOLD}0)${NC}  Cancel"
@@ -4663,11 +4730,27 @@ uninstall_vpn_menu() {
 
 uninstall_ikev2() {
     print_step "Uninstalling IKEv2 (strongSwan)..."
-    service_stop "strongswan"
-    service_stop "strongswan-starter" 2>/dev/null || true
-    eval "$PKG_REMOVE strongswan libstrongswan-standard-plugins libcharon-extra-plugins" 2>/dev/null || true
-    rm -f /etc/ipsec.conf /etc/ipsec.secrets
-    rm -rf /etc/ipsec.d
+
+    # Remove IKEv2-specific conn blocks from ipsec.conf
+    if [ -f /etc/ipsec.conf ]; then
+        sed -i '/^conn ikev2-eap$/,/^$/d' /etc/ipsec.conf
+        sed -i '/^conn ikev2-cert$/,/^$/d' /etc/ipsec.conf
+        sed -i '/^# BEGIN ikev2-cert-/,/^# END ikev2-cert-/d' /etc/ipsec.conf
+    fi
+
+    # Only remove strongSwan entirely if L2TP isn't also installed (they share it)
+    if ! vpn_is_installed "$VPN_L2TP"; then
+        service_stop "strongswan"
+        service_stop "strongswan-starter" 2>/dev/null || true
+        eval "$PKG_REMOVE strongswan libstrongswan-standard-plugins libcharon-extra-plugins" 2>/dev/null || true
+        rm -f /etc/ipsec.conf /etc/ipsec.secrets
+        rm -rf /etc/ipsec.d
+    else
+        # L2TP still needs strongSwan — just remove EAP entries from ipsec.secrets
+        sed -i '/: EAP /d' /etc/ipsec.secrets
+        ipsec restart &>/dev/null || true
+    fi
+
     # Remove IKEv2 firewall rules
     fw_delete INPUT -p udp --dport "${IKEV2_PORT}" -j ACCEPT 2>/dev/null || true
     fw_delete INPUT -p udp --dport "${IKEV2_NAT_PORT}" -j ACCEPT 2>/dev/null || true
@@ -4681,11 +4764,32 @@ uninstall_l2tp() {
     service_stop "xl2tpd"
     eval "$PKG_REMOVE xl2tpd" 2>/dev/null || true
     rm -f /etc/xl2tpd/xl2tpd.conf /etc/ppp/options.xl2tpd
-    # Remove L2TP IPsec conn from ipsec.conf
+
+    # Remove L2TP-specific IPsec conn and PSK from shared config
     if [ -f /etc/ipsec.conf ]; then
         sed -i '/^# L2TP\/IPsec/,/^$/d' /etc/ipsec.conf 2>/dev/null || true
         sed -i '/^conn L2TP-PSK/,/^$/d' /etc/ipsec.conf 2>/dev/null || true
     fi
+    if [ -f /etc/ipsec.secrets ]; then
+        sed -i '/^%any %any : PSK /d' /etc/ipsec.secrets
+    fi
+
+    # Remove chap-secrets entries
+    if [ -f /etc/ppp/chap-secrets ]; then
+        sed -i '/ l2tpd /d' /etc/ppp/chap-secrets
+    fi
+
+    # Only remove strongSwan if IKEv2 isn't also installed
+    if ! vpn_is_installed "$VPN_IKEV2"; then
+        service_stop "strongswan"
+        service_stop "strongswan-starter" 2>/dev/null || true
+        eval "$PKG_REMOVE strongswan" 2>/dev/null || true
+        rm -f /etc/ipsec.conf /etc/ipsec.secrets
+        rm -rf /etc/ipsec.d
+    else
+        ipsec restart &>/dev/null || true
+    fi
+
     fw_delete INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT 2>/dev/null || true
     save_iptables
     mark_vpn_uninstalled "$VPN_L2TP"
@@ -4867,9 +4971,10 @@ apply_split_tunneling() {
         if [ "$mode" = "full" ]; then
             sed -i 's|leftsubnet=.*|leftsubnet=0.0.0.0/0|' /etc/ipsec.conf
         else
-            local ike_subnets
+            local ike_subnets escaped_subnets
             ike_subnets=$(echo "$subnets" | tr ',' ' ')
-            sed -i "s|leftsubnet=.*|leftsubnet=${ike_subnets}|" /etc/ipsec.conf
+            escaped_subnets=$(sed_escape_replacement "$ike_subnets")
+            sed -i "s|leftsubnet=.*|leftsubnet=${escaped_subnets}|" /etc/ipsec.conf
         fi
         service_restart "strongswan"
         print_success "IKEv2 split tunneling configured."
@@ -5208,7 +5313,7 @@ remove_port_forward_rule() {
 
     # Remove from state
     local new_rules
-    new_rules=$(echo "$pf_rules" | tr ';' '\n' | grep -Fv "^${target_rule}$" | tr '\n' ';' | sed 's/;$//')
+    new_rules=$(echo "$pf_rules" | tr ';' '\n' | grep -Fxv "$target_rule" | tr '\n' ';' | sed 's/;$//')
     save_state "PORT_FORWARDING_RULES" "$new_rules"
 
     print_success "Rule removed: ${target_rule}"
@@ -5284,7 +5389,303 @@ IPV6_SYSCTL
     print_success "IPv6 disabled system-wide and removed from VPN configurations."
 }
 #==============================================================================
-# §33  FIRST RUN SETUP ORCHESTRATOR
+# §33  POST-INSTALL VALIDATION
+#==============================================================================
+
+# Check if a UDP port is listening
+check_port_listening() {
+    local port="$1"
+    if command -v ss &>/dev/null; then
+        ss -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+    elif command -v netstat &>/dev/null; then
+        netstat -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+    fi
+    return 1
+}
+
+validate_ikev2() {
+    local errors=0
+
+    # Service running
+    if service_is_active "strongswan" || service_is_active "strongswan-starter"; then
+        print_done "strongSwan service is running"
+    else
+        print_error "strongSwan service is NOT running"
+        errors=$((errors + 1))
+    fi
+
+    # Ports
+    if check_port_listening "$IKEV2_PORT"; then
+        print_done "UDP port ${IKEV2_PORT} (IKE) is listening"
+    else
+        print_error "UDP port ${IKEV2_PORT} (IKE) is NOT listening"
+        errors=$((errors + 1))
+    fi
+    if check_port_listening "$IKEV2_NAT_PORT"; then
+        print_done "UDP port ${IKEV2_NAT_PORT} (NAT-T) is listening"
+    else
+        print_error "UDP port ${IKEV2_NAT_PORT} (NAT-T) is NOT listening"
+        errors=$((errors + 1))
+    fi
+
+    # ipsec statusall — connections loaded
+    local ipsec_status
+    ipsec_status=$(ipsec statusall 2>/dev/null)
+    if echo "$ipsec_status" | grep -q "ikev2-eap"; then
+        print_done "IKEv2 EAP connection loaded"
+    else
+        print_error "IKEv2 EAP connection NOT loaded in strongSwan"
+        errors=$((errors + 1))
+    fi
+    if echo "$ipsec_status" | grep -q "ikev2-cert"; then
+        print_done "IKEv2 cert connection loaded"
+    else
+        print_error "IKEv2 cert connection NOT loaded in strongSwan"
+        errors=$((errors + 1))
+    fi
+
+    # Server certificate validity
+    if [ -f "${CERTS_DIR}/server.crt" ]; then
+        if openssl verify -CAfile "${CERTS_DIR}/ca.crt" "${CERTS_DIR}/server.crt" &>/dev/null; then
+            print_done "Server certificate is valid (verified against CA)"
+        else
+            print_error "Server certificate FAILED verification against CA"
+            errors=$((errors + 1))
+        fi
+    else
+        print_error "Server certificate not found at ${CERTS_DIR}/server.crt"
+        errors=$((errors + 1))
+    fi
+
+    # NAT/MASQUERADE rule
+    if iptables -t nat -S 2>/dev/null | grep -q "MASQUERADE"; then
+        print_done "iptables NAT MASQUERADE rule present"
+    else
+        print_warning "No iptables NAT MASQUERADE rule found"
+    fi
+
+    return $errors
+}
+
+validate_l2tp() {
+    local errors=0
+
+    # xl2tpd service
+    if service_is_active "xl2tpd"; then
+        print_done "xl2tpd service is running"
+    else
+        print_error "xl2tpd service is NOT running"
+        errors=$((errors + 1))
+    fi
+
+    # Port 1701
+    if check_port_listening "$L2TP_PORT"; then
+        print_done "UDP port ${L2TP_PORT} (L2TP) is listening"
+    else
+        print_error "UDP port ${L2TP_PORT} (L2TP) is NOT listening"
+        errors=$((errors + 1))
+    fi
+
+    # strongSwan must also be running for L2TP/IPsec
+    if service_is_active "strongswan" || service_is_active "strongswan-starter"; then
+        print_done "strongSwan service is running (required for L2TP/IPsec)"
+    else
+        print_error "strongSwan service is NOT running (L2TP/IPsec will fail)"
+        errors=$((errors + 1))
+    fi
+
+    # L2TP-PSK connection loaded
+    local ipsec_status
+    ipsec_status=$(ipsec statusall 2>/dev/null)
+    if echo "$ipsec_status" | grep -q "L2TP-PSK"; then
+        print_done "L2TP-PSK connection loaded in strongSwan"
+    else
+        print_error "L2TP-PSK connection NOT loaded in strongSwan"
+        errors=$((errors + 1))
+    fi
+
+    # PSK in secrets
+    if grep -q "^%any %any : PSK " /etc/ipsec.secrets 2>/dev/null; then
+        print_done "L2TP PSK is present in ipsec.secrets"
+    else
+        print_error "L2TP PSK is MISSING from ipsec.secrets"
+        errors=$((errors + 1))
+    fi
+
+    return $errors
+}
+
+validate_wireguard() {
+    local errors=0
+
+    # Service running
+    if service_is_active "wg-quick@wg0"; then
+        print_done "WireGuard (wg-quick@wg0) service is running"
+    else
+        print_error "WireGuard (wg-quick@wg0) service is NOT running"
+        errors=$((errors + 1))
+    fi
+
+    # Port
+    if check_port_listening "$WG_PORT"; then
+        print_done "UDP port ${WG_PORT} (WireGuard) is listening"
+    else
+        print_error "UDP port ${WG_PORT} (WireGuard) is NOT listening"
+        errors=$((errors + 1))
+    fi
+
+    # wg0 interface
+    if ip link show wg0 &>/dev/null; then
+        print_done "wg0 interface exists"
+    else
+        print_error "wg0 interface does NOT exist"
+        errors=$((errors + 1))
+    fi
+
+    # Config file
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        print_done "WireGuard config file exists"
+    else
+        print_error "WireGuard config file not found at /etc/wireguard/wg0.conf"
+        errors=$((errors + 1))
+    fi
+
+    return $errors
+}
+
+validate_openvpn() {
+    local errors=0
+    local ovpn_svc
+    ovpn_svc=$(get_openvpn_svc)
+
+    # Service running
+    if service_is_active "$ovpn_svc"; then
+        print_done "OpenVPN (${ovpn_svc}) service is running"
+    else
+        print_error "OpenVPN (${ovpn_svc}) service is NOT running"
+        errors=$((errors + 1))
+    fi
+
+    # Port
+    if check_port_listening "$OVPN_PORT"; then
+        print_done "UDP port ${OVPN_PORT} (OpenVPN) is listening"
+    else
+        print_error "UDP port ${OVPN_PORT} (OpenVPN) is NOT listening"
+        errors=$((errors + 1))
+    fi
+
+    # tun0 interface
+    if ip link show tun0 &>/dev/null; then
+        print_done "tun0 interface exists"
+    else
+        print_error "tun0 interface does NOT exist"
+        errors=$((errors + 1))
+    fi
+
+    # Config file
+    if [ -f "${OPENVPN_DIR}/server.conf" ]; then
+        print_done "OpenVPN server config exists"
+    else
+        print_error "OpenVPN server config not found at ${OPENVPN_DIR}/server.conf"
+        errors=$((errors + 1))
+    fi
+
+    # Auth script
+    if [ -f "${OPENVPN_DIR}/auth/verify.sh" ] && [ -x "${OPENVPN_DIR}/auth/verify.sh" ]; then
+        print_done "OpenVPN auth verify script is present and executable"
+    else
+        print_error "OpenVPN auth verify script missing or not executable"
+        errors=$((errors + 1))
+    fi
+
+    # Server cert EKU (extendedKeyUsage=serverAuth)
+    if [ -f "${OPENVPN_DIR}/server/server.crt" ]; then
+        if openssl x509 -in "${OPENVPN_DIR}/server/server.crt" -noout -purpose 2>/dev/null | grep -q "SSL server : Yes"; then
+            print_done "Server certificate has serverAuth EKU"
+        else
+            print_warning "Server certificate may be missing serverAuth EKU"
+        fi
+    fi
+
+    return $errors
+}
+
+validate_vpn_installation() {
+    print_section "Post-Install Validation"
+    echo ""
+
+    local total_errors=0
+    local vpn_errors
+
+    # IP forwarding
+    local ipv4_fwd
+    ipv4_fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+    if [ "$ipv4_fwd" = "1" ]; then
+        print_done "IPv4 forwarding is enabled"
+    else
+        print_error "IPv4 forwarding is NOT enabled"
+        total_errors=$((total_errors + 1))
+    fi
+
+    echo ""
+
+    if vpn_is_installed "$VPN_IKEV2"; then
+        echo -e "  ${BOLD}IKEv2/IPsec:${NC}"
+        vpn_errors=0
+        validate_ikev2 || vpn_errors=$?
+        total_errors=$((total_errors + vpn_errors))
+        echo ""
+    fi
+
+    if vpn_is_installed "$VPN_L2TP"; then
+        echo -e "  ${BOLD}L2TP/IPsec:${NC}"
+        vpn_errors=0
+        validate_l2tp || vpn_errors=$?
+        total_errors=$((total_errors + vpn_errors))
+        echo ""
+    fi
+
+    if vpn_is_installed "$VPN_WG"; then
+        echo -e "  ${BOLD}WireGuard:${NC}"
+        vpn_errors=0
+        validate_wireguard || vpn_errors=$?
+        total_errors=$((total_errors + vpn_errors))
+        echo ""
+    fi
+
+    if vpn_is_installed "$VPN_OVPN"; then
+        echo -e "  ${BOLD}OpenVPN:${NC}"
+        vpn_errors=0
+        validate_openvpn || vpn_errors=$?
+        total_errors=$((total_errors + vpn_errors))
+        echo ""
+    fi
+
+    # CA certificate
+    if [ -f "${CERTS_DIR}/ca.crt" ]; then
+        local ca_end
+        ca_end=$(openssl x509 -in "${CERTS_DIR}/ca.crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+        if [ -n "$ca_end" ]; then
+            print_done "CA certificate valid until: ${ca_end}"
+        fi
+    else
+        print_error "CA certificate not found at ${CERTS_DIR}/ca.crt"
+        total_errors=$((total_errors + 1))
+    fi
+
+    echo ""
+    if [ "$total_errors" -eq 0 ]; then
+        print_success "All validation checks passed!"
+    else
+        print_warning "${total_errors} validation issue(s) found. Review the errors above."
+        print_info "Some issues may resolve after a system reboot."
+    fi
+
+    return $total_errors
+}
+
+#==============================================================================
+# §34  FIRST RUN SETUP ORCHESTRATOR
 #==============================================================================
 
 first_run_setup() {
@@ -5330,12 +5731,27 @@ first_run_setup() {
 
     # Step 6: Generate CA and server certificate
     generate_ca_cert
-    if [ "$SETUP_ADDR_TYPE" = "dns" ] && obtain_letsencrypt_cert "$SETUP_ADDRESS" "$SETUP_LE_EMAIL"; then
-        print_success "Using Let's Encrypt certificate for ${SETUP_ADDRESS}."
-    else
-        if [ "$SETUP_ADDR_TYPE" = "dns" ]; then
-            print_warning "Let's Encrypt failed. Falling back to self-signed certificate."
+    if [ "$SETUP_ADDR_TYPE" = "dns" ]; then
+        if obtain_letsencrypt_cert "$SETUP_ADDRESS" "$SETUP_LE_EMAIL"; then
+            print_success "Using Let's Encrypt certificate for ${SETUP_ADDRESS}."
+        else
+            echo ""
+            print_warning "Let's Encrypt certificate could not be obtained."
+            print_warning "Common causes:"
+            echo -e "  ${DIM}  - Port 80 is blocked by a cloud/VPS firewall (security group)${NC}"
+            echo -e "  ${DIM}  - DNS does not point to this server's IP yet${NC}"
+            echo -e "  ${DIM}  - Another service is using port 80${NC}"
+            echo ""
+            if ask_yn "Continue with a self-signed certificate instead?" "y"; then
+                print_info "Using self-signed certificate."
+                generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
+                save_state "CERT_TYPE" "self-signed"
+            else
+                print_error "Installation aborted. Fix the issue above and re-run the script."
+                exit 1
+            fi
         fi
+    else
         generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
         save_state "CERT_TYPE" "self-signed"
     fi
@@ -5363,7 +5779,10 @@ first_run_setup() {
 
     create_vpn_user "$SETUP_USERNAME" "$SETUP_PASSWORD" "$SETUP_PSK"
 
-    # Step 9: Final summary
+    # Step 9: Validate installation
+    validate_vpn_installation
+
+    # Step 10: Final summary
     print_final_summary
 }
 
@@ -5432,7 +5851,7 @@ print_final_summary() {
 }
 
 #==============================================================================
-# §34  MAIN ENTRY POINT
+# §35  MAIN ENTRY POINT
 #==============================================================================
 
 main() {
