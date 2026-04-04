@@ -1402,8 +1402,6 @@ obtain_letsencrypt_cert() {
         --standalone \
         --non-interactive \
         --agree-tos \
-        --key-type rsa \
-        --rsa-key-size 2048 \
         --email "$email" \
         -d "$domain" \
         --cert-name "vpn-server" \
@@ -1428,6 +1426,13 @@ obtain_letsencrypt_cert() {
     cp "${le_dir}/chain.pem"     "${CERTS_DIR}/le_chain.crt"
     chmod 600 "${CERTS_DIR}/server.key"
 
+    # Detect LE key type (certbot 2.0+ defaults to ECDSA)
+    local le_key_type="RSA"
+    if openssl ec -in "${CERTS_DIR}/server.key" -noout 2>/dev/null; then
+        le_key_type="ECDSA"
+    fi
+    save_state "SERVER_KEY_TYPE" "$le_key_type"
+
     save_state "CERT_TYPE"  "letsencrypt"
     save_state "LE_DOMAIN"  "$domain"
     save_state "LE_EMAIL"   "$email"
@@ -1449,17 +1454,34 @@ _write_le_deploy_hooks() {
 # Runs after each successful certbot renewal
 LE_DIR="/etc/letsencrypt/live/vpn-server"
 CERTS_DIR="/etc/vpn-setup/certs"
+STATE_FILE="/etc/vpn-setup/state.conf"
 
 cp "${LE_DIR}/fullchain.pem" "${CERTS_DIR}/server.crt"
 cp "${LE_DIR}/privkey.pem"   "${CERTS_DIR}/server.key"
 cp "${LE_DIR}/chain.pem"     "${CERTS_DIR}/le_chain.crt"
 chmod 600 "${CERTS_DIR}/server.key"
 
+# Detect key type (certbot may switch between RSA/ECDSA across renewals)
+KEY_TYPE="RSA"
+if openssl ec -in "${CERTS_DIR}/server.key" -noout 2>/dev/null; then
+    KEY_TYPE="ECDSA"
+fi
+
+# Update state file
+if [ -f "$STATE_FILE" ]; then
+    sed -i "s|^SERVER_KEY_TYPE=.*|SERVER_KEY_TYPE=${KEY_TYPE}|" "$STATE_FILE"
+fi
+
 # IKEv2 (strongSwan)
 if [ -d /etc/ipsec.d ]; then
     cp "${CERTS_DIR}/server.crt" /etc/ipsec.d/certs/server.crt
     cp "${CERTS_DIR}/server.key" /etc/ipsec.d/private/server.key
     chmod 600 /etc/ipsec.d/private/server.key
+    # Update ipsec.secrets key type declaration
+    if [ -f /etc/ipsec.secrets ]; then
+        sed -i "s|^: RSA server\.key|: ${KEY_TYPE} server.key|" /etc/ipsec.secrets
+        sed -i "s|^: ECDSA server\.key|: ${KEY_TYPE} server.key|" /etc/ipsec.secrets
+    fi
     ipsec restart >/dev/null 2>&1 || true
 fi
 
@@ -1621,6 +1643,7 @@ EXT_EOF
         2>/dev/null || { print_error "Failed to sign server certificate."; exit 1; }
 
     rm -f "$san_ext"
+    save_state "SERVER_KEY_TYPE" "RSA"
     print_success "Server certificate generated: ${server_crt}"
 }
 
@@ -1824,13 +1847,18 @@ IPSEC_CONF
     print_step "Writing ipsec.secrets..."
     [ -f /etc/ipsec.secrets ] && cp /etc/ipsec.secrets /etc/ipsec.secrets.bak.$(date +%Y%m%d%H%M%S)
 
+    # Detect server key type: LE may be ECDSA, self-signed is always RSA
+    local server_key_type
+    server_key_type=$(get_state "SERVER_KEY_TYPE")
+    [ -z "$server_key_type" ] && server_key_type="RSA"
+
     cat > /etc/ipsec.secrets << IPSEC_SECRETS
 # /etc/ipsec.secrets - VPN Credentials
 # Managed by vpn-setup.sh — DO NOT EDIT MANUALLY
 # Format: %any username : EAP "password"
 # Format: %any %any : PSK "psk"
 
-: RSA server.key
+: ${server_key_type} server.key
 
 IPSEC_SECRETS
     chmod 600 /etc/ipsec.secrets
@@ -4591,12 +4619,18 @@ change_server_address_menu() {
     cp "${CERTS_DIR}/server.key" "${OPENVPN_DIR}/server/" 2>/dev/null || true
     chmod 600 "${OPENVPN_DIR}/server/server.key" 2>/dev/null || true
 
-    # Update ipsec.conf server ID
+    # Update ipsec.conf server ID and ipsec.secrets key type
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
         local new_leftid escaped_leftid
         new_leftid=$([ "$new_type" = "dns" ] && echo "@${new_addr}" || echo "${new_addr}")
         escaped_leftid=$(sed_escape_replacement "$new_leftid")
         sed -i "s|leftid=.*|leftid=${escaped_leftid}|" /etc/ipsec.conf 2>/dev/null || true
+        # Key type may have changed (LE→self-signed or vice versa)
+        local new_key_type
+        new_key_type=$(get_state "SERVER_KEY_TYPE")
+        [ -z "$new_key_type" ] && new_key_type="RSA"
+        sed -i "s|^: RSA server\.key|: ${new_key_type} server.key|" /etc/ipsec.secrets 2>/dev/null || true
+        sed -i "s|^: ECDSA server\.key|: ${new_key_type} server.key|" /etc/ipsec.secrets 2>/dev/null || true
         ipsec restart &>/dev/null || true
     fi
 
