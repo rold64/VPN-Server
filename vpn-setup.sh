@@ -3539,7 +3539,8 @@ show_management_menu() {
         echo -e "  ${BOLD}3)${NC} Change VPN DNS resolver(s)"
         echo -e "  ${BOLD}4)${NC} Update VPN servers"
         echo -e "  ${BOLD}5)${NC} Uninstall VPN server(s)"
-        echo -e "  ${BOLD}6)${NC} Advanced"
+        echo -e "  ${BOLD}6)${NC} Validate & fix VPN services"
+        echo -e "  ${BOLD}7)${NC} Advanced"
         echo -e "  ${BOLD}0)${NC} Exit"
         echo ""
         echo -en "${YELLOW}  ?${NC}  Enter choice: "
@@ -3551,9 +3552,10 @@ show_management_menu() {
             3) change_dns_menu ;;
             4) update_vpn_menu ;;
             5) uninstall_vpn_menu ;;
-            6) show_advanced_menu ;;
+            6) validate_vpn_installation; press_enter ;;
+            7) show_advanced_menu ;;
             0) echo ""; print_info "Exiting."; exit 0 ;;
-            *) print_warning "Invalid choice. Please enter 0-6." ;;
+            *) print_warning "Invalid choice. Please enter 0-7." ;;
         esac
     done
 }
