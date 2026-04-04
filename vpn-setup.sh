@@ -5389,7 +5389,7 @@ IPV6_SYSCTL
     print_success "IPv6 disabled system-wide and removed from VPN configurations."
 }
 #==============================================================================
-# §33  POST-INSTALL VALIDATION
+# §33  POST-INSTALL VALIDATION (with auto-fix)
 #==============================================================================
 
 # Check if a UDP port is listening
@@ -5403,29 +5403,87 @@ check_port_listening() {
     return 1
 }
 
+# Wait for a systemd service to leave "activating" state (up to N seconds)
+wait_for_service() {
+    local svc="$1"
+    local max_wait="${2:-5}"
+    local i=0
+    while [ "$i" -lt "$max_wait" ]; do
+        local state
+        state=$(systemctl is-active "$svc" 2>/dev/null)
+        [ "$state" != "activating" ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Attempt to start/restart a service and wait for it to become active
+try_fix_service() {
+    local svc="$1"
+    local label="$2"
+    print_info "Attempting to restart ${label}..."
+    systemctl restart "$svc" &>/dev/null
+    sleep 2
+    wait_for_service "$svc" 5
+    if service_is_active "$svc"; then
+        print_done "${label} restarted successfully"
+        return 0
+    fi
+    return 1
+}
+
+# Check if strongSwan is active (tries both service names)
+strongswan_is_active() {
+    service_is_active "strongswan" || service_is_active "strongswan-starter"
+}
+
+# Restart strongSwan (tries both service names)
+restart_strongswan() {
+    systemctl restart strongswan &>/dev/null || systemctl restart strongswan-starter &>/dev/null
+    sleep 2
+}
+
 validate_ikev2() {
     local errors=0
 
     # Service running
-    if service_is_active "strongswan" || service_is_active "strongswan-starter"; then
+    if strongswan_is_active; then
         print_done "strongSwan service is running"
     else
-        print_error "strongSwan service is NOT running"
-        errors=$((errors + 1))
+        print_warning "strongSwan service is NOT running — attempting restart..."
+        restart_strongswan
+        if strongswan_is_active; then
+            print_done "strongSwan service restarted successfully"
+        else
+            print_error "strongSwan service could NOT be started"
+            errors=$((errors + 1))
+        fi
     fi
 
-    # Ports
+    # Ports — if not listening, service restart above may not have settled yet
     if check_port_listening "$IKEV2_PORT"; then
         print_done "UDP port ${IKEV2_PORT} (IKE) is listening"
     else
-        print_error "UDP port ${IKEV2_PORT} (IKE) is NOT listening"
-        errors=$((errors + 1))
+        # Port comes from the service — if service was just restarted, wait a moment
+        sleep 1
+        if check_port_listening "$IKEV2_PORT"; then
+            print_done "UDP port ${IKEV2_PORT} (IKE) is listening"
+        else
+            print_error "UDP port ${IKEV2_PORT} (IKE) is NOT listening"
+            errors=$((errors + 1))
+        fi
     fi
     if check_port_listening "$IKEV2_NAT_PORT"; then
         print_done "UDP port ${IKEV2_NAT_PORT} (NAT-T) is listening"
     else
-        print_error "UDP port ${IKEV2_NAT_PORT} (NAT-T) is NOT listening"
-        errors=$((errors + 1))
+        sleep 1
+        if check_port_listening "$IKEV2_NAT_PORT"; then
+            print_done "UDP port ${IKEV2_NAT_PORT} (NAT-T) is listening"
+        else
+            print_error "UDP port ${IKEV2_NAT_PORT} (NAT-T) is NOT listening"
+            errors=$((errors + 1))
+        fi
     fi
 
     # ipsec statusall — connections loaded
@@ -5434,28 +5492,44 @@ validate_ikev2() {
     if echo "$ipsec_status" | grep -q "ikev2-eap"; then
         print_done "IKEv2 EAP connection loaded"
     else
-        print_error "IKEv2 EAP connection NOT loaded in strongSwan"
-        errors=$((errors + 1))
+        # Try reloading connections
+        print_warning "IKEv2 EAP connection not loaded — attempting ipsec reload..."
+        ipsec reload &>/dev/null
+        sleep 1
+        ipsec_status=$(ipsec statusall 2>/dev/null)
+        if echo "$ipsec_status" | grep -q "ikev2-eap"; then
+            print_done "IKEv2 EAP connection loaded after reload"
+        else
+            print_error "IKEv2 EAP connection NOT loaded in strongSwan"
+            errors=$((errors + 1))
+        fi
     fi
     if echo "$ipsec_status" | grep -q "ikev2-cert"; then
         print_done "IKEv2 cert connection loaded"
     else
-        print_error "IKEv2 cert connection NOT loaded in strongSwan"
-        errors=$((errors + 1))
+        if ! echo "$ipsec_status" | grep -q "ikev2-cert"; then
+            # Reload was already attempted above — just re-check
+            ipsec_status=$(ipsec statusall 2>/dev/null)
+        fi
+        if echo "$ipsec_status" | grep -q "ikev2-cert"; then
+            print_done "IKEv2 cert connection loaded"
+        else
+            print_error "IKEv2 cert connection NOT loaded in strongSwan"
+            errors=$((errors + 1))
+        fi
     fi
 
     # Server certificate validity
     local cert_type
     cert_type=$(get_state "CERT_TYPE" 2>/dev/null)
     if [ "$cert_type" = "letsencrypt" ]; then
-        # LE certs are signed by Let's Encrypt CA, not our self-signed CA
         local le_domain
         le_domain=$(get_state "LE_DOMAIN" 2>/dev/null)
         if [ -n "$le_domain" ] && [ -f "${LE_CERTS_BASE}/${le_domain}/fullchain.pem" ]; then
             if openssl x509 -in "${LE_CERTS_BASE}/${le_domain}/cert.pem" -noout -checkend 0 &>/dev/null; then
                 print_done "Let's Encrypt server certificate is valid (not expired)"
             else
-                print_error "Let's Encrypt server certificate is expired"
+                print_error "Let's Encrypt server certificate is expired — run: certbot renew"
                 errors=$((errors + 1))
             fi
         else
@@ -5477,7 +5551,22 @@ validate_ikev2() {
     if iptables -t nat -S 2>/dev/null | grep -q "MASQUERADE"; then
         print_done "iptables NAT MASQUERADE rule present"
     else
-        print_warning "No iptables NAT MASQUERADE rule found"
+        print_warning "No iptables NAT MASQUERADE rule — attempting to add..."
+        local iface
+        iface=$(get_primary_iface)
+        if [ -n "$iface" ]; then
+            iptables -t nat -A POSTROUTING -s "${IKEV2_SUBNET}" -o "${iface}" -j MASQUERADE 2>/dev/null
+            save_iptables
+            if iptables -t nat -S 2>/dev/null | grep -q "MASQUERADE"; then
+                print_done "iptables NAT MASQUERADE rule added"
+            else
+                print_error "Failed to add iptables NAT MASQUERADE rule"
+                errors=$((errors + 1))
+            fi
+        else
+            print_error "Cannot determine primary network interface for NAT rule"
+            errors=$((errors + 1))
+        fi
     fi
 
     return $errors
@@ -5490,24 +5579,40 @@ validate_l2tp() {
     if service_is_active "xl2tpd"; then
         print_done "xl2tpd service is running"
     else
-        print_error "xl2tpd service is NOT running"
-        errors=$((errors + 1))
+        print_warning "xl2tpd service is NOT running — attempting restart..."
+        if try_fix_service "xl2tpd" "xl2tpd"; then
+            true
+        else
+            print_error "xl2tpd service could NOT be started"
+            errors=$((errors + 1))
+        fi
     fi
 
     # Port 1701
     if check_port_listening "$L2TP_PORT"; then
         print_done "UDP port ${L2TP_PORT} (L2TP) is listening"
     else
-        print_error "UDP port ${L2TP_PORT} (L2TP) is NOT listening"
-        errors=$((errors + 1))
+        sleep 1
+        if check_port_listening "$L2TP_PORT"; then
+            print_done "UDP port ${L2TP_PORT} (L2TP) is listening"
+        else
+            print_error "UDP port ${L2TP_PORT} (L2TP) is NOT listening"
+            errors=$((errors + 1))
+        fi
     fi
 
     # strongSwan must also be running for L2TP/IPsec
-    if service_is_active "strongswan" || service_is_active "strongswan-starter"; then
+    if strongswan_is_active; then
         print_done "strongSwan service is running (required for L2TP/IPsec)"
     else
-        print_error "strongSwan service is NOT running (L2TP/IPsec will fail)"
-        errors=$((errors + 1))
+        print_warning "strongSwan service is NOT running — attempting restart..."
+        restart_strongswan
+        if strongswan_is_active; then
+            print_done "strongSwan restarted successfully"
+        else
+            print_error "strongSwan service could NOT be started (L2TP/IPsec will fail)"
+            errors=$((errors + 1))
+        fi
     fi
 
     # L2TP-PSK connection loaded
@@ -5516,16 +5621,42 @@ validate_l2tp() {
     if echo "$ipsec_status" | grep -q "L2TP-PSK"; then
         print_done "L2TP-PSK connection loaded in strongSwan"
     else
-        print_error "L2TP-PSK connection NOT loaded in strongSwan"
-        errors=$((errors + 1))
+        print_warning "L2TP-PSK connection not loaded — attempting ipsec reload..."
+        ipsec reload &>/dev/null
+        sleep 1
+        ipsec_status=$(ipsec statusall 2>/dev/null)
+        if echo "$ipsec_status" | grep -q "L2TP-PSK"; then
+            print_done "L2TP-PSK connection loaded after reload"
+        else
+            print_error "L2TP-PSK connection NOT loaded in strongSwan"
+            errors=$((errors + 1))
+        fi
     fi
 
     # PSK in secrets
     if grep -q "^%any %any : PSK " /etc/ipsec.secrets 2>/dev/null; then
         print_done "L2TP PSK is present in ipsec.secrets"
     else
-        print_error "L2TP PSK is MISSING from ipsec.secrets"
-        errors=$((errors + 1))
+        # Try to recover PSK from state and write it
+        local saved_psk
+        saved_psk=$(get_state "L2TP_PSK" 2>/dev/null)
+        if [ -n "$saved_psk" ]; then
+            print_warning "L2TP PSK missing from ipsec.secrets — restoring from state..."
+            local escaped_psk
+            escaped_psk=$(escape_ipsec "$saved_psk")
+            echo "%any %any : PSK \"${escaped_psk}\"" >> /etc/ipsec.secrets
+            ipsec restart &>/dev/null
+            sleep 1
+            if grep -q "^%any %any : PSK " /etc/ipsec.secrets 2>/dev/null; then
+                print_done "L2TP PSK restored to ipsec.secrets"
+            else
+                print_error "Failed to restore L2TP PSK to ipsec.secrets"
+                errors=$((errors + 1))
+            fi
+        else
+            print_error "L2TP PSK is MISSING from ipsec.secrets (no saved PSK in state to restore)"
+            errors=$((errors + 1))
+        fi
     fi
 
     return $errors
@@ -5534,20 +5665,40 @@ validate_l2tp() {
 validate_wireguard() {
     local errors=0
 
+    # Config file (check first — service can't start without it)
+    if [ -f /etc/wireguard/wg0.conf ]; then
+        print_done "WireGuard config file exists"
+    else
+        print_error "WireGuard config file not found at /etc/wireguard/wg0.conf"
+        errors=$((errors + 1))
+        # Can't fix anything else without the config
+        return $errors
+    fi
+
     # Service running
     if service_is_active "wg-quick@wg0"; then
         print_done "WireGuard (wg-quick@wg0) service is running"
     else
-        print_error "WireGuard (wg-quick@wg0) service is NOT running"
-        errors=$((errors + 1))
+        print_warning "WireGuard service is NOT running — attempting restart..."
+        if try_fix_service "wg-quick@wg0" "WireGuard"; then
+            true
+        else
+            print_error "WireGuard (wg-quick@wg0) service could NOT be started"
+            errors=$((errors + 1))
+        fi
     fi
 
     # Port
     if check_port_listening "$WG_PORT"; then
         print_done "UDP port ${WG_PORT} (WireGuard) is listening"
     else
-        print_error "UDP port ${WG_PORT} (WireGuard) is NOT listening"
-        errors=$((errors + 1))
+        sleep 1
+        if check_port_listening "$WG_PORT"; then
+            print_done "UDP port ${WG_PORT} (WireGuard) is listening"
+        else
+            print_error "UDP port ${WG_PORT} (WireGuard) is NOT listening"
+            errors=$((errors + 1))
+        fi
     fi
 
     # wg0 interface
@@ -5555,14 +5706,6 @@ validate_wireguard() {
         print_done "wg0 interface exists"
     else
         print_error "wg0 interface does NOT exist"
-        errors=$((errors + 1))
-    fi
-
-    # Config file
-    if [ -f /etc/wireguard/wg0.conf ]; then
-        print_done "WireGuard config file exists"
-    else
-        print_error "WireGuard config file not found at /etc/wireguard/wg0.conf"
         errors=$((errors + 1))
     fi
 
@@ -5574,57 +5717,94 @@ validate_openvpn() {
     local ovpn_svc
     ovpn_svc=$(get_openvpn_svc)
 
-    # OpenVPN can take a moment to start — wait up to 5 seconds if it's still activating
+    # Config file (check first — service can't start without it)
+    if [ -f "${OPENVPN_DIR}/server.conf" ]; then
+        print_done "OpenVPN server config exists"
+    else
+        print_error "OpenVPN server config not found at ${OPENVPN_DIR}/server.conf"
+        errors=$((errors + 1))
+        # Can't fix service issues without the config
+        return $errors
+    fi
+
+    # Wait if service is still activating from initial install
     local svc_state
     svc_state=$(systemctl is-active "$ovpn_svc" 2>/dev/null)
     if [ "$svc_state" = "activating" ]; then
         print_info "OpenVPN is still starting, waiting up to 5 seconds..."
-        local wait_count=0
-        while [ "$wait_count" -lt 5 ]; do
-            sleep 1
-            wait_count=$((wait_count + 1))
-            svc_state=$(systemctl is-active "$ovpn_svc" 2>/dev/null)
-            [ "$svc_state" != "activating" ] && break
-        done
+        wait_for_service "$ovpn_svc" 5
+        svc_state=$(systemctl is-active "$ovpn_svc" 2>/dev/null)
     fi
 
     # Service running
     if service_is_active "$ovpn_svc"; then
         print_done "OpenVPN (${ovpn_svc}) service is running"
     else
-        print_error "OpenVPN (${ovpn_svc}) service is NOT running (status: ${svc_state})"
-        errors=$((errors + 1))
+        print_warning "OpenVPN (${ovpn_svc}) is NOT running (status: ${svc_state}) — attempting restart..."
+        if try_fix_service "$ovpn_svc" "OpenVPN"; then
+            true
+        else
+            # Try the alternate service name in case detection was wrong
+            local alt_svc
+            if [ "$ovpn_svc" = "openvpn@server" ]; then
+                alt_svc="openvpn-server@server"
+            else
+                alt_svc="openvpn@server"
+            fi
+            print_info "Trying alternate service name: ${alt_svc}..."
+            if try_fix_service "$alt_svc" "OpenVPN (${alt_svc})"; then
+                # Update the cached service name
+                _OPENVPN_SVC="$alt_svc"
+                save_state "OPENVPN_SERVICE" "$alt_svc"
+                ovpn_svc="$alt_svc"
+            else
+                print_error "OpenVPN service could NOT be started"
+                errors=$((errors + 1))
+            fi
+        fi
     fi
 
     # Port
     if check_port_listening "$OVPN_PORT"; then
         print_done "UDP port ${OVPN_PORT} (OpenVPN) is listening"
     else
-        print_error "UDP port ${OVPN_PORT} (OpenVPN) is NOT listening"
-        errors=$((errors + 1))
+        sleep 1
+        if check_port_listening "$OVPN_PORT"; then
+            print_done "UDP port ${OVPN_PORT} (OpenVPN) is listening"
+        else
+            print_error "UDP port ${OVPN_PORT} (OpenVPN) is NOT listening"
+            errors=$((errors + 1))
+        fi
     fi
 
     # tun0 interface
     if ip link show tun0 &>/dev/null; then
         print_done "tun0 interface exists"
     else
-        print_error "tun0 interface does NOT exist"
-        errors=$((errors + 1))
-    fi
-
-    # Config file
-    if [ -f "${OPENVPN_DIR}/server.conf" ]; then
-        print_done "OpenVPN server config exists"
-    else
-        print_error "OpenVPN server config not found at ${OPENVPN_DIR}/server.conf"
-        errors=$((errors + 1))
+        # May appear shortly after service starts
+        sleep 1
+        if ip link show tun0 &>/dev/null; then
+            print_done "tun0 interface exists"
+        else
+            print_error "tun0 interface does NOT exist"
+            errors=$((errors + 1))
+        fi
     fi
 
     # Auth script
     if [ -f "${OPENVPN_DIR}/auth/verify.sh" ] && [ -x "${OPENVPN_DIR}/auth/verify.sh" ]; then
         print_done "OpenVPN auth verify script is present and executable"
+    elif [ -f "${OPENVPN_DIR}/auth/verify.sh" ]; then
+        print_warning "Auth verify script exists but is not executable — fixing permissions..."
+        chmod +x "${OPENVPN_DIR}/auth/verify.sh"
+        if [ -x "${OPENVPN_DIR}/auth/verify.sh" ]; then
+            print_done "Auth verify script permissions fixed"
+        else
+            print_error "Failed to set execute permission on verify.sh"
+            errors=$((errors + 1))
+        fi
     else
-        print_error "OpenVPN auth verify script missing or not executable"
+        print_error "OpenVPN auth verify script missing at ${OPENVPN_DIR}/auth/verify.sh"
         errors=$((errors + 1))
     fi
 
@@ -5646,6 +5826,7 @@ validate_vpn_installation() {
 
     local total_errors=0
     local vpn_errors
+    local fixed_count=0
 
     # IP forwarding
     local ipv4_fwd
@@ -5653,8 +5834,17 @@ validate_vpn_installation() {
     if [ "$ipv4_fwd" = "1" ]; then
         print_done "IPv4 forwarding is enabled"
     else
-        print_error "IPv4 forwarding is NOT enabled"
-        total_errors=$((total_errors + 1))
+        print_warning "IPv4 forwarding is NOT enabled — fixing..."
+        sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+        sysctl -w net.ipv4.conf.all.forwarding=1 &>/dev/null
+        ipv4_fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+        if [ "$ipv4_fwd" = "1" ]; then
+            print_done "IPv4 forwarding re-enabled"
+            fixed_count=$((fixed_count + 1))
+        else
+            print_error "IPv4 forwarding could NOT be enabled"
+            total_errors=$((total_errors + 1))
+        fi
     fi
 
     echo ""
@@ -5707,7 +5897,7 @@ validate_vpn_installation() {
     if [ "$total_errors" -eq 0 ]; then
         print_success "All validation checks passed!"
     else
-        print_warning "${total_errors} validation issue(s) found. Review the errors above."
+        print_warning "${total_errors} issue(s) could not be auto-fixed. Review the errors above."
         print_info "Some issues may resolve after a system reboot."
     fi
 
