@@ -1142,27 +1142,31 @@ ask_user_credentials() {
         fi
     done
 
-    # Pre-shared key (PSK) — used for IKEv2 PSK mode and L2TP/IPsec
-    local psk1 psk2
-    echo ""
-    echo -e "  ${DIM}The Pre-Shared Key (PSK) is used for IKEv2 PSK-mode and L2TP/IPsec${NC}"
-    echo -e "  ${DIM}authentication. L2TP clients will need this key.${NC}"
-    while true; do
-        echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden): "
-        read -rs psk1
+    # Pre-shared key (PSK) — only needed for IKEv2 PSK mode and L2TP/IPsec
+    if in_list "$VPN_IKEV2" "$SETUP_VPNS" || in_list "$VPN_L2TP" "$SETUP_VPNS"; then
+        local psk1 psk2
         echo ""
-        echo -en "${YELLOW}  ?${NC}  Confirm Pre-Shared Key: "
-        read -rs psk2
-        echo ""
-        if [ -z "$psk1" ]; then
-            print_warning "  PSK cannot be empty."
-        elif [ "$psk1" != "$psk2" ]; then
-            print_warning "  PSKs do not match. Please try again."
-        else
-            SETUP_PSK="$psk1"
-            break
-        fi
-    done
+        echo -e "  ${DIM}The Pre-Shared Key (PSK) is used for IKEv2 PSK-mode and L2TP/IPsec${NC}"
+        echo -e "  ${DIM}authentication. L2TP clients will need this key.${NC}"
+        while true; do
+            echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden): "
+            read -rs psk1
+            echo ""
+            echo -en "${YELLOW}  ?${NC}  Confirm Pre-Shared Key: "
+            read -rs psk2
+            echo ""
+            if [ -z "$psk1" ]; then
+                print_warning "  PSK cannot be empty."
+            elif [ "$psk1" != "$psk2" ]; then
+                print_warning "  PSKs do not match. Please try again."
+            else
+                SETUP_PSK="$psk1"
+                break
+            fi
+        done
+    else
+        SETUP_PSK=""
+    fi
 
     echo ""
     print_success "Credentials captured for user: ${BOLD}${SETUP_USERNAME}${NC}"
@@ -2688,11 +2692,13 @@ create_vpn_user() {
 
     print_section "Creating VPN User: ${username}"
 
-    # Generate client certificate (used by IKEv2 cert-auth and OpenVPN)
-    generate_client_cert "$username" "$password" || {
-        print_error "Failed to generate client certificate for ${username}. Aborting user creation."
-        return 1
-    }
+    # Generate client certificate (only needed for IKEv2 cert-auth and OpenVPN)
+    if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_OVPN"; then
+        generate_client_cert "$username" "$password" || {
+            print_error "Failed to generate client certificate for ${username}. Aborting user creation."
+            return 1
+        }
+    fi
 
     # Add to each installed VPN
     if vpn_is_installed "$VPN_IKEV2"; then
@@ -2783,10 +2789,14 @@ generate_all_profiles() {
 
     print_section "Generating Profile Files for: ${username}"
 
-    # Copy CA cert and P12 to profile dir
-    cp "${CERTS_DIR}/ca.crt" "${PROFILES_BASE}/${username}/${username}_ca.crt"
-    if [ -f "${CERTS_DIR}/users/${username}/client.p12" ]; then
-        cp "${CERTS_DIR}/users/${username}/client.p12" "${PROFILES_BASE}/${username}/${username}_client_cert.p12"
+    # Copy CA cert and P12 to profile dir (only needed for cert-based VPNs)
+    if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_OVPN"; then
+        if [ -f "${CERTS_DIR}/ca.crt" ]; then
+            cp "${CERTS_DIR}/ca.crt" "${PROFILES_BASE}/${username}/${username}_ca.crt"
+        fi
+        if [ -f "${CERTS_DIR}/users/${username}/client.p12" ]; then
+            cp "${CERTS_DIR}/users/${username}/client.p12" "${PROFILES_BASE}/${username}/${username}_client_cert.p12"
+        fi
     fi
 
     if vpn_is_installed "$VPN_IKEV2"; then
@@ -3440,7 +3450,9 @@ generate_connection_info() {
 
     print_step "Generating connection info summary..."
 
-    cat > "$out_file" << INFO
+    # Build connection info with only installed VPN sections
+    {
+        cat << INFO_HEADER
 ================================================================================
   VPN Connection Information for: ${username}
   Generated: $(date)
@@ -3457,7 +3469,15 @@ CREDENTIALS
 -----------
   Username       : ${username}
   Password       : ${display_password}
-  Pre-Shared Key : ${psk_stored:-${psk}}
+INFO_HEADER
+
+        # Only show PSK if IKEv2 or L2TP is installed
+        if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
+            echo "  Pre-Shared Key : ${psk_stored:-${psk}}"
+        fi
+
+        if vpn_is_installed "$VPN_IKEV2"; then
+            cat << INFO_IKEV2
 
 ================================================================================
  IKEv2/IPsec (strongSwan)
@@ -3482,6 +3502,11 @@ CREDENTIALS
     Auth         : EAP-MSCHAPv2
     Username     : ${username}
     Password     : ${display_password}
+INFO_IKEV2
+        fi
+
+        if vpn_is_installed "$VPN_L2TP"; then
+            cat << INFO_L2TP
 
 ================================================================================
  L2TP/IPsec
@@ -3498,6 +3523,11 @@ CREDENTIALS
     Pre-Shared Key   : ${psk_stored:-${psk}}
     Username         : ${username}
     Password         : ${display_password}
+INFO_L2TP
+        fi
+
+        if vpn_is_installed "$VPN_WG"; then
+            cat << INFO_WG
 
 ================================================================================
  WireGuard
@@ -3508,6 +3538,11 @@ CREDENTIALS
 
   Import the .conf file into the WireGuard app.
   No username/password needed — key-based authentication.
+INFO_WG
+        fi
+
+        if vpn_is_installed "$VPN_OVPN"; then
+            cat << INFO_OVPN
 
 ================================================================================
  OpenVPN
@@ -3520,20 +3555,32 @@ CREDENTIALS
 
   Import the .ovpn file into any OpenVPN client.
   Enter username/password when prompted.
+INFO_OVPN
+        fi
+
+        # CA cert section only if cert-based VPN is installed
+        if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_OVPN"; then
+            cat << INFO_CA
 
 ================================================================================
  CA CERTIFICATE
 ================================================================================
   File: ${username}_ca.crt
-$(is_letsencrypt && echo "  This certificate is NOT needed for device trust — the server uses a
-  Let's Encrypt certificate which is publicly trusted on all devices.
-  It is included for reference only (signs client certificates for IKEv2 cert auth)." \
-|| echo "  Import this certificate as a trusted CA on your device/system.
-  Required for IKEv2 (EAP and Certificate) and OpenVPN on devices
-  that do not automatically trust self-signed certificates.")
+INFO_CA
+            if is_letsencrypt; then
+                echo "  This certificate is NOT needed for device trust — the server uses a"
+                echo "  Let's Encrypt certificate which is publicly trusted on all devices."
+                echo "  It is included for reference only (signs client certificates for IKEv2 cert auth)."
+            else
+                echo "  Import this certificate as a trusted CA on your device/system."
+                echo "  Required for IKEv2 (EAP and Certificate) and OpenVPN on devices"
+                echo "  that do not automatically trust self-signed certificates."
+            fi
+        fi
 
-================================================================================
-INFO
+        echo ""
+        echo "================================================================================"
+    } > "$out_file"
 
     chmod 600 "$out_file"
     print_done "Connection info: ${out_file}"
@@ -3672,22 +3719,26 @@ add_user_menu() {
         fi
     done
 
-    # PSK
-    while true; do
-        echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden, used for IKEv2/L2TP): "
-        read -rs new_psk
-        echo ""
-        echo -en "${YELLOW}  ?${NC}  Confirm PSK: "
-        read -rs confirm_psk
-        echo ""
-        if [ -z "$new_psk" ]; then
-            print_warning "PSK cannot be empty."
-        elif [ "$new_psk" != "$confirm_psk" ]; then
-            print_warning "PSKs do not match."
-        else
-            break
-        fi
-    done
+    # PSK — only prompt if IKEv2 or L2TP is installed
+    if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
+        while true; do
+            echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden, used for IKEv2/L2TP): "
+            read -rs new_psk
+            echo ""
+            echo -en "${YELLOW}  ?${NC}  Confirm PSK: "
+            read -rs confirm_psk
+            echo ""
+            if [ -z "$new_psk" ]; then
+                print_warning "PSK cannot be empty."
+            elif [ "$new_psk" != "$confirm_psk" ]; then
+                print_warning "PSKs do not match."
+            else
+                break
+            fi
+        done
+    else
+        new_psk=""
+    fi
 
     create_vpn_user "$new_username" "$new_password" "$new_psk"
     press_enter
@@ -3755,22 +3806,26 @@ batch_add_interactive() {
             fi
         done
 
-        # PSK
-        while true; do
-            echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden): "
-            read -rs new_psk
-            echo ""
-            echo -en "${YELLOW}  ?${NC}  Confirm PSK: "
-            read -rs confirm_psk
-            echo ""
-            if [ -z "$new_psk" ]; then
-                print_warning "PSK cannot be empty."
-            elif [ "$new_psk" != "$confirm_psk" ]; then
-                print_warning "PSKs do not match."
-            else
-                break
-            fi
-        done
+        # PSK — only prompt if IKEv2 or L2TP is installed
+        if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
+            while true; do
+                echo -en "${YELLOW}  ?${NC}  Pre-Shared Key (hidden): "
+                read -rs new_psk
+                echo ""
+                echo -en "${YELLOW}  ?${NC}  Confirm PSK: "
+                read -rs confirm_psk
+                echo ""
+                if [ -z "$new_psk" ]; then
+                    print_warning "PSK cannot be empty."
+                elif [ "$new_psk" != "$confirm_psk" ]; then
+                    print_warning "PSKs do not match."
+                else
+                    break
+                fi
+            done
+        else
+            new_psk=""
+        fi
 
         create_vpn_user "$new_username" "$new_password" "$new_psk" "true"
         ((total_created++))
@@ -3805,7 +3860,15 @@ batch_add_interactive() {
 
 batch_add_from_csv() {
     print_section "Batch Add Users — CSV Import"
-    echo -e "  CSV format: ${BOLD}username,password,psk${NC}  (# lines and blank lines are skipped)"
+    local needs_psk=false
+    if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
+        needs_psk=true
+    fi
+    if $needs_psk; then
+        echo -e "  CSV format: ${BOLD}username,password,psk${NC}  (# lines and blank lines are skipped)"
+    else
+        echo -e "  CSV format: ${BOLD}username,password${NC}  (# lines and blank lines are skipped)"
+    fi
     echo ""
     echo -en "${YELLOW}  ?${NC}  Path to CSV file (or 0 to cancel): "
     read -r csv_path
@@ -3854,7 +3917,7 @@ batch_add_from_csv() {
             row_ok=false
         fi
 
-        if [ -z "$csv_psk" ]; then
+        if $needs_psk && [ -z "$csv_psk" ]; then
             print_warning "Line ${line_num}: PSK is empty"
             row_ok=false
         fi
@@ -4084,11 +4147,13 @@ update_user_credentials() {
             echo "${username}:${new_hash}" >> "${OPENVPN_DIR}/auth/users.passwd"
         fi
 
-        # Regenerate client cert (P12 export password = VPN password)
-        generate_client_cert "$username" "$new_password" || {
-            print_error "Failed to regenerate client certificate for ${username}. Aborting credential update."
-            return 1
-        }
+        # Regenerate client cert (only needed for IKEv2 cert-auth and OpenVPN)
+        if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_OVPN"; then
+            generate_client_cert "$username" "$new_password" || {
+                print_error "Failed to regenerate client certificate for ${username}. Aborting credential update."
+                return 1
+            }
+        fi
 
         # Regenerate all profile files
         generate_all_profiles "$username" "$new_password" "$effective_psk"
@@ -5984,31 +6049,35 @@ first_run_setup() {
     setup_ip_forwarding
     setup_firewall_base
 
-    # Step 6: Generate CA and server certificate
-    generate_ca_cert
-    if [ "$SETUP_ADDR_TYPE" = "dns" ]; then
-        if obtain_letsencrypt_cert "$SETUP_ADDRESS" "$SETUP_LE_EMAIL"; then
-            print_success "Using Let's Encrypt certificate for ${SETUP_ADDRESS}."
-        else
-            echo ""
-            print_warning "Let's Encrypt certificate could not be obtained."
-            print_warning "Common causes:"
-            echo -e "  ${DIM}  - Port 80 is blocked by a cloud/VPS firewall (security group)${NC}"
-            echo -e "  ${DIM}  - DNS does not point to this server's IP yet${NC}"
-            echo -e "  ${DIM}  - Another service is using port 80${NC}"
-            echo ""
-            if ask_yn "Continue with a self-signed certificate instead?" "y"; then
-                print_info "Using self-signed certificate."
-                generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
-                save_state "CERT_TYPE" "self-signed"
+    # Step 6: Generate CA and server certificate (only needed for IKEv2 and OpenVPN)
+    if in_list "$VPN_IKEV2" "$SETUP_VPNS" || in_list "$VPN_OVPN" "$SETUP_VPNS"; then
+        generate_ca_cert
+        if [ "$SETUP_ADDR_TYPE" = "dns" ]; then
+            if obtain_letsencrypt_cert "$SETUP_ADDRESS" "$SETUP_LE_EMAIL"; then
+                print_success "Using Let's Encrypt certificate for ${SETUP_ADDRESS}."
             else
-                print_error "Installation aborted. Fix the issue above and re-run the script."
-                exit 1
+                echo ""
+                print_warning "Let's Encrypt certificate could not be obtained."
+                print_warning "Common causes:"
+                echo -e "  ${DIM}  - Port 80 is blocked by a cloud/VPS firewall (security group)${NC}"
+                echo -e "  ${DIM}  - DNS does not point to this server's IP yet${NC}"
+                echo -e "  ${DIM}  - Another service is using port 80${NC}"
+                echo ""
+                if ask_yn "Continue with a self-signed certificate instead?" "y"; then
+                    print_info "Using self-signed certificate."
+                    generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
+                    save_state "CERT_TYPE" "self-signed"
+                else
+                    print_error "Installation aborted. Fix the issue above and re-run the script."
+                    exit 1
+                fi
             fi
+        else
+            generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
+            save_state "CERT_TYPE" "self-signed"
         fi
     else
-        generate_server_cert "$SETUP_ADDRESS" "$SETUP_ADDR_TYPE"
-        save_state "CERT_TYPE" "self-signed"
+        print_info "Skipping certificate generation (not needed for selected VPN types)."
     fi
 
     # Step 7: Install selected VPN servers
