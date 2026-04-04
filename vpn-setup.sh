@@ -5445,7 +5445,23 @@ validate_ikev2() {
     fi
 
     # Server certificate validity
-    if [ -f "${CERTS_DIR}/server.crt" ]; then
+    local cert_type
+    cert_type=$(get_state "CERT_TYPE" 2>/dev/null)
+    if [ "$cert_type" = "letsencrypt" ]; then
+        # LE certs are signed by Let's Encrypt CA, not our self-signed CA
+        local le_domain
+        le_domain=$(get_state "LE_DOMAIN" 2>/dev/null)
+        if [ -n "$le_domain" ] && [ -f "${LE_CERTS_BASE}/${le_domain}/fullchain.pem" ]; then
+            if openssl x509 -in "${LE_CERTS_BASE}/${le_domain}/cert.pem" -noout -checkend 0 &>/dev/null; then
+                print_done "Let's Encrypt server certificate is valid (not expired)"
+            else
+                print_error "Let's Encrypt server certificate is expired"
+                errors=$((errors + 1))
+            fi
+        else
+            print_warning "Let's Encrypt certificate files not found — verify certbot setup"
+        fi
+    elif [ -f "${CERTS_DIR}/server.crt" ]; then
         if openssl verify -CAfile "${CERTS_DIR}/ca.crt" "${CERTS_DIR}/server.crt" &>/dev/null; then
             print_done "Server certificate is valid (verified against CA)"
         else
@@ -5558,11 +5574,25 @@ validate_openvpn() {
     local ovpn_svc
     ovpn_svc=$(get_openvpn_svc)
 
+    # OpenVPN can take a moment to start — wait up to 5 seconds if it's still activating
+    local svc_state
+    svc_state=$(systemctl is-active "$ovpn_svc" 2>/dev/null)
+    if [ "$svc_state" = "activating" ]; then
+        print_info "OpenVPN is still starting, waiting up to 5 seconds..."
+        local wait_count=0
+        while [ "$wait_count" -lt 5 ]; do
+            sleep 1
+            wait_count=$((wait_count + 1))
+            svc_state=$(systemctl is-active "$ovpn_svc" 2>/dev/null)
+            [ "$svc_state" != "activating" ] && break
+        done
+    fi
+
     # Service running
     if service_is_active "$ovpn_svc"; then
         print_done "OpenVPN (${ovpn_svc}) service is running"
     else
-        print_error "OpenVPN (${ovpn_svc}) service is NOT running"
+        print_error "OpenVPN (${ovpn_svc}) service is NOT running (status: ${svc_state})"
         errors=$((errors + 1))
     fi
 
@@ -5810,22 +5840,22 @@ print_final_summary() {
     echo -e "  ${BOLD}Service Status:${NC}"
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
         local ss_status
-        ss_status=$(systemctl is-active strongswan 2>/dev/null || systemctl is-active strongswan-starter 2>/dev/null || echo "unknown")
+        ss_status=$(systemctl is-active strongswan 2>/dev/null) || ss_status=$(systemctl is-active strongswan-starter 2>/dev/null) || ss_status="unknown"
         echo -e "    strongSwan  : ${ss_status}"
     fi
     if vpn_is_installed "$VPN_L2TP"; then
         local l2tp_status
-        l2tp_status=$(systemctl is-active xl2tpd 2>/dev/null || echo "unknown")
+        l2tp_status=$(systemctl is-active xl2tpd 2>/dev/null) || l2tp_status="unknown"
         echo -e "    xl2tpd      : ${l2tp_status}"
     fi
     if vpn_is_installed "$VPN_WG"; then
         local wg_status
-        wg_status=$(systemctl is-active wg-quick@wg0 2>/dev/null || echo "unknown")
+        wg_status=$(systemctl is-active wg-quick@wg0 2>/dev/null) || wg_status="unknown"
         echo -e "    WireGuard   : ${wg_status}"
     fi
     if vpn_is_installed "$VPN_OVPN"; then
         local ovpn_status
-        ovpn_status=$(systemctl is-active "$(get_openvpn_svc)" 2>/dev/null || echo "unknown")
+        ovpn_status=$(systemctl is-active "$(get_openvpn_svc)" 2>/dev/null) || ovpn_status="unknown"
         echo -e "    OpenVPN     : ${ovpn_status}"
     fi
 
