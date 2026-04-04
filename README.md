@@ -29,6 +29,7 @@ Run it again at any time to add users, change settings, or manage your VPN serve
 - 🔄 **Re-run aware** — detects existing installations and presents a management menu instead of reinstalling
 - 🏗️ **Self-signed PKI** — auto-generates a full certificate authority with 10-year validity; no external CA needed
 - 🌍 **Let's Encrypt support** — when a DNS hostname is used, obtains a trusted LE certificate automatically via certbot HTTP-01; falls back to self-signed if LE fails; auto-renews via certbot's systemd timer/cron
+- 🩺 **Self-healing validation** — post-install health check verifies every service, port, interface, certificate, and firewall rule; automatically fixes what it can (service restarts, sysctl, iptables, PSK restore)
 
 ---
 
@@ -97,7 +98,7 @@ VPNs      : ikev2,l2tp,wireguard,openvpn
 IPv6      : yes
 DNS       : 1.1.1.1 / 8.8.8.8
 Users     : 3
-Profiles  : /etc/VPN User Profiles
+Profiles  : /etc/vpn-profiles
 
 Management Options:
 
@@ -106,7 +107,8 @@ Management Options:
   3) Change VPN DNS resolver(s)
   4) Update VPN servers
   5) Uninstall VPN server(s)
-  6) Advanced
+  6) Validate & fix VPN services
+  7) Advanced
   0) Exit
 ```
 
@@ -162,7 +164,7 @@ Updating a password regenerates the client certificate, P12 bundle, and all prof
 
 > **PSK note:** The L2TP pre-shared key is server-wide. Updating it regenerates connection info for all users and requires existing L2TP clients to reconnect with the new PSK.
 
-**Export user list** — writes a CSV template to `/etc/VPN User Profiles/users_export.csv` with all current usernames. Passwords are not stored — fill them in and use "Import from CSV" to re-provision or migrate users.
+**Export user list** — writes a CSV template to `/etc/vpn-profiles/users_export.csv` with all current usernames. Passwords are not stored — fill them in and use "Import from CSV" to re-provision or migrate users.
 
 **List users** — shows all users with their assigned WireGuard and OpenVPN IPs and profile file counts.
 
@@ -183,6 +185,21 @@ Updating a password regenerates the client certificate, P12 bundle, and all prof
 - Select individual VPN servers or all at once
 - Stops services, removes packages, cleans up config files and firewall rules
 - Updates the state file so re-running the script shows the correct installed state
+- IKEv2 and L2TP share strongSwan — uninstalling one preserves the shared config for the other
+
+**6 — Validate & fix VPN services**
+- Runs a comprehensive health check across all installed VPN services
+- Checks: service status, port listening, interface existence, ipsec connections loaded, certificate validity, iptables NAT rules, auth script permissions, IP forwarding
+- **Auto-fix**: when an issue is detected, the validator attempts automatic remediation before reporting an error:
+  - Service not running → restart and re-check
+  - IPv4 forwarding off → re-enable via sysctl
+  - NAT MASQUERADE rule missing → re-add for VPN subnets
+  - ipsec connections not loaded → reload and re-check
+  - L2TP PSK missing from secrets → restore from saved state
+  - OpenVPN verify.sh not executable → fix permissions
+  - OpenVPN wrong service name → try alternate name, update state
+- Only reports errors that could not be auto-fixed
+- Also runs automatically at the end of first-time installation
 
 </details>
 
@@ -209,7 +226,7 @@ Two separate connection profiles are maintained in `ipsec.conf`:
 
 Credentials are stored in `/etc/ipsec.secrets`:
 ```
-username : EAP "password"
+%any username : EAP "password"
 : RSA server.key
 ```
 
@@ -316,7 +333,7 @@ The CA key never leaves the server. Distribute `ca.crt` (or the `.mobileconfig`/
 For each user, profile files are generated in:
 
 ```
-/etc/VPN User Profiles/
+/etc/vpn-profiles/
 └── alice/
     ├── alice_ikev2_eap.mobileconfig      ← Apple: IKEv2 username/password
     ├── alice_ikev2_cert.mobileconfig     ← Apple: IKEv2 certificate auth
@@ -390,7 +407,7 @@ Enter one number for the same provider as both primary/secondary, or two numbers
 <summary><strong>⚙️ Advanced Options</strong></summary>
 <br>
 
-Access via **Management Menu → 6 → Advanced**:
+Access via **Management Menu → 7 → Advanced**:
 
 ```
 Advanced Options
@@ -536,7 +553,18 @@ OPENVPN_SERVICE=openvpn@server
 <summary><strong>🔍 Troubleshooting</strong></summary>
 <br>
 
-### Check service status
+### Built-in validation
+
+The fastest way to diagnose issues is the built-in validator:
+
+```bash
+sudo bash vpn-setup.sh
+# Choose option 6 — Validate & fix VPN services
+```
+
+This checks every service, port, interface, ipsec connection, certificate, and firewall rule — and automatically attempts to fix any issues it finds (service restarts, sysctl re-enable, iptables re-add, PSK restore, etc.). Only issues that can't be auto-fixed are reported as errors.
+
+### Check service status manually
 
 ```bash
 # IKEv2 / L2TP (strongSwan)
@@ -597,7 +625,7 @@ The script updates all credential stores, regenerates the client certificate and
 
 ### Regenerate profile files
 
-If you need to re-generate profile files (e.g. after changing the server address), use the Update user option with the same credentials — or remove and re-add the user. The CA and server certificate are preserved — only user certs are regenerated.
+Changing the server address (option 2) automatically regenerates WireGuard configs, OpenVPN `.ovpn` profiles, IKEv2 EAP mobileconfigs, and connection info for all users. Certificate-based profiles (IKEv2 cert mobileconfig, `.sswan`, Windows PS1) require the P12 password to regenerate — use **Update user** to set a new password, which regenerates those profiles.
 
 ### Common issues
 
@@ -629,6 +657,8 @@ If you need to re-generate profile files (e.g. after changing the server address
 | L2TP connects then drops | Firewall blocking ESP packets | Open protocol `50` (ESP) and `51` (AH) in cloud firewall |
 | WireGuard: no internet | NAT not working | Check `iptables -t nat -L -n`, verify `ip_forward` is `1` |
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
+| Uninstalling IKEv2 broke L2TP (or vice versa) | Old script removed shared `ipsec.conf`/`ipsec.secrets` when uninstalling one protocol | Fixed — uninstall now only removes protocol-specific entries; shared strongSwan files/packages are kept when the other protocol is still installed |
+| OpenVPN auth broken on RHEL: `Permission denied` on `users.passwd` | Auth directory owned by `root:nogroup` but RHEL uses `nobody` group | Fixed — script detects RHEL and uses `root:nobody` |
 
 </details>
 
@@ -653,7 +683,7 @@ If you need to re-generate profile files (e.g. after changing the server address
 - **Cloud firewall**: Open only the specific UDP ports listed above — do not open all ports
 - **Rotate the CA** periodically if operating in a high-security environment (requires re-issuing all certs)
 - **Monitor logs**: `/var/log/openvpn.log`, `journalctl -u strongswan`, `journalctl -u wg-quick@wg0`
-- **Backup** `/etc/vpn-setup/` and `/etc/VPN User Profiles/` — these contain all keys and credentials
+- **Backup** `/etc/vpn-setup/` and `/etc/vpn-profiles/` — these contain all keys and credentials
 
 ### Certificate validity
 
@@ -697,7 +727,7 @@ The script installs only what is needed for the VPN types you select:
 <summary><strong>🏗️ Script Architecture</strong></summary>
 <br>
 
-The script is organized into logical sections within a single `vpn-setup.sh` file (~5,350 lines):
+The script is organized into logical sections within a single `vpn-setup.sh` file (~5,900 lines):
 
 ```
 vpn-setup.sh
@@ -752,12 +782,20 @@ vpn-setup.sh
 │   ├── Server address change
 │   ├── DNS change
 │   ├── Update / Uninstall
+│   ├── Validate & fix services (with auto-remediation)
 │   └── Advanced options
 │       ├── Split tunneling
 │       ├── Subnet access
 │       ├── Port forwarding
 │       ├── Let's Encrypt renewal (shown only when CERT_TYPE=letsencrypt)
 │       └── IPv6 disable
+├── Post-install validation (§33)
+│   ├── check_port_listening()     — ss/netstat UDP port check
+│   ├── validate_ikev2()           — service, ports 500/4500, ipsec connections, cert, NAT
+│   ├── validate_l2tp()            — xl2tpd, port 1701, strongSwan, L2TP-PSK conn, PSK in secrets
+│   ├── validate_wireguard()       — service, port 51820, wg0 interface, config file
+│   ├── validate_openvpn()         — service, port 1194, tun0, config, verify.sh, cert EKU
+│   └── validate_vpn_installation() — orchestrator, IPv4 forwarding, CA cert expiry
 └── main() — detects first run vs re-run
 ```
 
