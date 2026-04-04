@@ -891,18 +891,51 @@ ask_vpn_selection() {
     echo -e "  ${BOLD}4)${NC} OpenVPN       ${DIM}(username/password + certificate auth)${NC}"
     echo -e "  ${BOLD}5)${NC} All of the above"
     echo ""
+    echo -e "  ${DIM}Enter one or more numbers (e.g. 1 3 or 1,3,4)${NC}"
+    echo ""
 
     while true; do
-        echo -en "${YELLOW}  ?${NC}  Enter choice [1-5]: "
+        echo -en "${YELLOW}  ?${NC}  Enter choice: "
         read -r vpn_choice
-        case "$vpn_choice" in
-            1) SETUP_VPNS="$VPN_IKEV2"; break ;;
-            2) SETUP_VPNS="$VPN_L2TP"; break ;;
-            3) SETUP_VPNS="$VPN_WG"; break ;;
-            4) SETUP_VPNS="$VPN_OVPN"; break ;;
-            5) SETUP_VPNS="${VPN_IKEV2},${VPN_L2TP},${VPN_WG},${VPN_OVPN}"; break ;;
-            *) print_warning "Please enter a number between 1 and 5." ;;
-        esac
+
+        # Normalize: replace commas and spaces with newlines, deduplicate
+        local selections
+        selections=$(echo "$vpn_choice" | tr ',; ' '\n' | grep -E '^[1-5]$' | sort -u)
+
+        if [ -z "$selections" ]; then
+            print_warning "Please enter numbers between 1 and 5 (e.g. 1 3 or 5)."
+            continue
+        fi
+
+        # If 5 (all) is selected, override everything
+        if echo "$selections" | grep -qx "5"; then
+            SETUP_VPNS="${VPN_IKEV2},${VPN_L2TP},${VPN_WG},${VPN_OVPN}"
+            break
+        fi
+
+        # Build comma-separated list from individual selections
+        SETUP_VPNS=""
+        while read -r num; do
+            local vpn_name=""
+            case "$num" in
+                1) vpn_name="$VPN_IKEV2" ;;
+                2) vpn_name="$VPN_L2TP" ;;
+                3) vpn_name="$VPN_WG" ;;
+                4) vpn_name="$VPN_OVPN" ;;
+            esac
+            if [ -n "$vpn_name" ]; then
+                if [ -z "$SETUP_VPNS" ]; then
+                    SETUP_VPNS="$vpn_name"
+                else
+                    SETUP_VPNS="${SETUP_VPNS},${vpn_name}"
+                fi
+            fi
+        done <<< "$selections"
+
+        if [ -n "$SETUP_VPNS" ]; then
+            break
+        fi
+        print_warning "No valid selection. Please try again."
     done
 
     echo ""
