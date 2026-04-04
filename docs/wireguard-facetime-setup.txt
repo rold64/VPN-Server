@@ -1,0 +1,78 @@
+FaceTime over VPN in Censored Regions — WireGuard Setup
+========================================================
+
+Problem
+-------
+In regions where VoIP/FaceTime is censored, iOS native IKEv2 VPN cannot
+route FaceTime through the tunnel while also excluding local network traffic.
+
+- "Include All Networks" ON + "Exclude Local Networks" OFF = FaceTime works
+  but no local network access (AirDrop, printers, local devices)
+- "Include All Networks" ON + "Exclude Local Networks" ON = local access works
+  but FaceTime bypasses the tunnel and gets blocked
+
+This is an iOS platform limitation. Apple's "Exclude Local Networks" uses a
+broad definition of "local" that includes Apple relay/STUN servers used by
+FaceTime. There is no mobileconfig key to control this granularity.
+
+Solution: Use WireGuard Instead
+-------------------------------
+The WireGuard iOS app runs as a Network Extension (packet-tunnel provider),
+which gives it IP-based routing control independent of Apple's "local network"
+classification. By excluding only RFC 1918 private IP ranges from the tunnel,
+all public traffic (including Apple's FaceTime relay servers) goes through the
+VPN, while local LAN traffic stays direct.
+
+Steps
+-----
+1. Install the WireGuard app on your iPhone from the App Store.
+
+2. Transfer your WireGuard profile (username_wireguard.conf) to your iPhone.
+   - AirDrop, email, or Files app all work.
+
+3. Open the WireGuard app and tap "Add a tunnel" > "Create from file or archive".
+   Select the .conf file.
+
+4. Tap the tunnel name to edit it.
+
+5. In the "AllowedIPs" field, you will see:
+      0.0.0.0/0, ::/0
+   This routes ALL traffic through the tunnel (full tunnel mode).
+
+6. Tap the "Exclude Private IPs" button (built into the WireGuard iOS app).
+   This replaces 0.0.0.0/0, ::/0 with CIDR blocks that cover all PUBLIC IPs
+   while excluding private/local ranges:
+      - 10.0.0.0/8       (private)
+      - 172.16.0.0/12     (private)
+      - 192.168.0.0/16    (private)
+      - 169.254.0.0/16    (link-local)
+      - fc00::/7          (IPv6 ULA)
+      - fe80::/10         (IPv6 link-local)
+      - etc.
+
+7. Save the tunnel and connect.
+
+8. Test FaceTime — calls should now work through the VPN tunnel.
+   Local network access (AirDrop, printers, etc.) also works.
+
+Why This Works
+--------------
+- WireGuard routes traffic purely by IP range (AllowedIPs).
+- Apple's FaceTime relay/STUN servers use public IPs — they stay in the tunnel.
+- Only actual private/local IPs are excluded — no Apple "local services" magic.
+- Unlike native IKEv2, the WireGuard app's Network Extension framework does
+  not apply Apple's broad "Exclude Local Networks" classification.
+
+Why IKEv2 Cannot Do This
+-------------------------
+iOS native IKEv2 uses Apple's VPN framework directly. The "ExcludeLocalNetworks"
+mobileconfig key tells iOS to exempt "local" traffic, but Apple's definition
+includes more than just RFC 1918 addresses — it covers Apple relay infrastructure
+that FaceTime depends on. There is no mobileconfig key to override this behavior.
+
+Other IKEv2 mobileconfig keys that do NOT help:
+- EnforceRoutes: ignored when IncludeAllNetworks is true
+- VPN On Demand: controls WHEN the VPN connects, not WHAT traffic uses it
+- Provider Type (packet-tunnel / app-proxy): only for Network Extension VPN apps
+- ExcludeCellularServices / ExcludeAPNs / ExcludeDeviceCommunication:
+  unchecking these still does not fix FaceTime when ExcludeLocalNetworks is on
