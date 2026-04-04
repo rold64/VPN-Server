@@ -685,6 +685,8 @@ Changing the server address (option 2) automatically regenerates WireGuard confi
 - OpenVPN enforces `remote-cert-tls client` to prevent MITM
 - IKEv2 uses AES-256-GCM with PFS (Perfect Forward Secrecy) via ECP-384
 - Passwords are **never stored in plaintext** for OpenVPN (SHA-256 hash only)
+- **IPv6 leak prevention** — when IPv6 is disabled, `ip6tables FORWARD DROP` policy blocks all IPv6 forwarding so traffic cannot leak around the tunnel on dual-stack networks
+- WireGuard and OpenVPN use **separate IPv6 subnets** (`fddd:...:2c4::/64` and `fddd:...:2c5::/64`) to prevent address collisions when both are installed
 
 ### What you should do additionally
 

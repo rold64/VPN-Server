@@ -76,3 +76,36 @@ Other IKEv2 mobileconfig keys that do NOT help:
 - Provider Type (packet-tunnel / app-proxy): only for Network Extension VPN apps
 - ExcludeCellularServices / ExcludeAPNs / ExcludeDeviceCommunication:
   unchecking these still does not fix FaceTime when ExcludeLocalNetworks is on
+
+Always-On with On-Demand Activation
+------------------------------------
+For the best experience in a censored region, keep WireGuard connected at all
+times so FaceTime works instantly for both incoming and outgoing calls. There
+is no iOS trigger for "FaceTime call started" that can launch a VPN, so
+always-on is the practical approach.
+
+WireGuard is designed for this. Unlike IKEv2 or OpenVPN, it has essentially
+zero overhead when idle — no handshakes, no keepalive traffic, no session
+renegotiation, no battery drain. The protocol is "silent by default": if no
+data is being sent, it sends nothing. The kernel-level implementation on iOS
+just holds a routing table entry and a cryptographic session ready to go.
+When a packet needs to go out, it encrypts and sends instantly — no handshake
+delay.
+
+The only overhead is the PersistentKeepalive setting (usually 25 seconds),
+which sends a tiny 32-byte packet to keep NAT mappings alive. Without it, an
+idle tunnel behind NAT may go stale and need a brief re-handshake on the next
+packet. For always-on use, 25 seconds is fine — the overhead is negligible.
+
+To enable On-Demand activation:
+
+1. Open the WireGuard app.
+2. Tap the info (i) button next to your tunnel.
+3. Scroll to the "On-Demand" section.
+4. Enable it for Wi-Fi and Cellular (or both).
+5. Optionally restrict to specific Wi-Fi SSIDs.
+
+With this enabled, WireGuard connects automatically whenever your phone has
+network access and reconnects if the connection drops. Combined with the
+"Exclude Private IPs" setup, local network access still works and FaceTime
+is always ready to go through the tunnel.

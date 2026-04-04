@@ -79,11 +79,14 @@ WG_SERVER_IP="10.20.20.1"
 WG_SUBNET="10.20.20.0/24"
 WG_FIRST_CLIENT="10.20.20.2"
 WG_POOL_END="10.20.20.254"
+WG_SUBNET6="fddd:2c4:2c4:2c4::/64"
+WG_SERVER_IP6="fddd:2c4:2c4:2c4::1"
 
 OVPN_SERVER_IP="10.8.0.1"
 OVPN_SUBNET="10.8.0.0/24"
 OVPN_FIRST_CLIENT="10.8.0.2"
 OVPN_POOL_END="10.8.0.254"
+OVPN_SUBNET6="fddd:2c4:2c4:2c5::/64"
 
 # Ports
 IKEV2_PORT="500"
@@ -721,10 +724,19 @@ fw_delete() {
 }
 
 fw6_add() {
-    if [ "$(get_state "IPV6_ENABLED")" = "yes" ]; then
+    local ipv6
+    ipv6=$(get_state "IPV6_ENABLED" 2>/dev/null)
+    [ -z "$ipv6" ] && ipv6="$SETUP_IPV6"
+    if [ "$ipv6" = "yes" ]; then
         if ! ip6tables -C "$@" &>/dev/null; then
             ip6tables -A "$@"
         fi
+    fi
+}
+
+fw6_delete() {
+    if ip6tables -C "$@" &>/dev/null; then
+        ip6tables -D "$@"
     fi
 }
 #==============================================================================
@@ -1333,12 +1345,18 @@ setup_firewall_base() {
         iptables -t nat -A POSTROUTING -s "${OVPN_SUBNET}" -o "${iface}" -j MASQUERADE
     fi
 
-    # IPv6 if enabled
+    # IPv6 firewall
     if [ "$SETUP_IPV6" = "yes" ]; then
         ip6tables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
         ip6tables -A INPUT  -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
         ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
-        ip6tables -t nat -A POSTROUTING -o "${iface}" -j MASQUERADE 2>/dev/null || true
+    else
+        # IPv6 leak prevention: block all IPv6 forwarding so VPN clients
+        # cannot leak traffic over IPv6 on dual-stack networks
+        ip6tables -P FORWARD DROP 2>/dev/null || true
+        ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
+        ip6tables -A INPUT  -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
     fi
 
     save_iptables
@@ -1887,6 +1905,9 @@ configure_ikev2_firewall() {
     # Cert pool subnet
     fw_add FORWARD -s "10.10.11.0/24" -j ACCEPT
     fw_add FORWARD -d "10.10.11.0/24" -j ACCEPT
+    # IPv6
+    fw6_add INPUT -p udp --dport "${IKEV2_PORT}" -j ACCEPT
+    fw6_add INPUT -p udp --dport "${IKEV2_NAT_PORT}" -j ACCEPT
     save_iptables
     print_success "IKEv2 firewall rules set."
 }
@@ -2147,6 +2168,10 @@ configure_l2tp_firewall() {
     fw_add INPUT -p ah -j ACCEPT
     fw_add FORWARD -s "${L2TP_SUBNET}" -j ACCEPT
     fw_add FORWARD -d "${L2TP_SUBNET}" -j ACCEPT
+    # IPv6
+    fw6_add INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT
+    fw6_add INPUT -p esp -j ACCEPT
+    fw6_add INPUT -p ah -j ACCEPT
 
     # L2TP needs NAT
     if ! iptables -t nat -C POSTROUTING -s "${L2TP_SUBNET}" -o "${iface}" -j MASQUERADE &>/dev/null; then
@@ -2274,9 +2299,9 @@ configure_wireguard() {
     local postdown_rules="iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE"
 
     if [ "$ipv6_enabled" = "yes" ]; then
-        wg_address="${WG_SERVER_IP}/24, fddd:2c4:2c4:2c4::1/64"
-        postup_rules="${postup_rules}; ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${iface} -j MASQUERADE"
-        postdown_rules="${postdown_rules}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE"
+        wg_address="${WG_SERVER_IP}/24, ${WG_SERVER_IP6}/64"
+        postup_rules="${postup_rules}; ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -s ${WG_SUBNET6} -o ${iface} -j MASQUERADE"
+        postdown_rules="${postdown_rules}; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -s ${WG_SUBNET6} -o ${iface} -j MASQUERADE"
     fi
 
     cat > /etc/wireguard/wg0.conf << WG_CONF
@@ -2304,6 +2329,7 @@ WG_CONF
 configure_wireguard_firewall() {
     print_step "Configuring WireGuard firewall rules..."
     fw_add INPUT -p udp --dport "${WG_PORT}" -j ACCEPT
+    fw6_add INPUT -p udp --dport "${WG_PORT}" -j ACCEPT
     save_iptables
     print_success "WireGuard firewall rules set."
 }
@@ -2532,7 +2558,7 @@ push \"dhcp-option DNS ${dns2}\""
     local ipv6_directives=""
     if [ "$ipv6_enabled" = "yes" ]; then
         ipv6_directives="
-server-ipv6 fddd:2c4:2c4:2c4::/64
+server-ipv6 ${OVPN_SUBNET6}
 push \"route-ipv6 2000::/3\""
     fi
 
@@ -2660,6 +2686,19 @@ configure_openvpn_firewall() {
 
     if ! iptables -t nat -C POSTROUTING -s "${OVPN_SUBNET}" -o "${iface}" -j MASQUERADE &>/dev/null; then
         iptables -t nat -A POSTROUTING -s "${OVPN_SUBNET}" -o "${iface}" -j MASQUERADE
+    fi
+
+    # IPv6
+    fw6_add INPUT -p udp --dport "${OVPN_PORT}" -j ACCEPT
+    fw6_add FORWARD -i tun0 -j ACCEPT
+    fw6_add FORWARD -o tun0 -j ACCEPT
+    local ipv6
+    ipv6=$(get_state "IPV6_ENABLED" 2>/dev/null)
+    [ -z "$ipv6" ] && ipv6="$SETUP_IPV6"
+    if [ "$ipv6" = "yes" ]; then
+        if ! ip6tables -t nat -C POSTROUTING -s "${OVPN_SUBNET6}" -o "${iface}" -j MASQUERADE &>/dev/null; then
+            ip6tables -t nat -A POSTROUTING -s "${OVPN_SUBNET6}" -o "${iface}" -j MASQUERADE
+        fi
     fi
 
     save_iptables
@@ -3375,7 +3414,7 @@ generate_wireguard_conf() {
 
     local allowed_ips="0.0.0.0/0"
     if [ "$ipv6_enabled" = "yes" ]; then
-        client_address="${client_ip}/32, fddd:2c4:2c4:2c4::$(echo "$client_ip" | awk -F. '{print $4}')/128"
+        client_address="${client_ip}/32, ${WG_SERVER_IP6%::*}::$(echo "$client_ip" | awk -F. '{print $4}')/128"
         allowed_ips="0.0.0.0/0, ::/0"
     fi
 
@@ -4916,6 +4955,8 @@ uninstall_ikev2() {
     # Remove IKEv2 firewall rules
     fw_delete INPUT -p udp --dport "${IKEV2_PORT}" -j ACCEPT 2>/dev/null || true
     fw_delete INPUT -p udp --dport "${IKEV2_NAT_PORT}" -j ACCEPT 2>/dev/null || true
+    fw6_delete INPUT -p udp --dport "${IKEV2_PORT}" -j ACCEPT 2>/dev/null || true
+    fw6_delete INPUT -p udp --dport "${IKEV2_NAT_PORT}" -j ACCEPT 2>/dev/null || true
     save_iptables
     mark_vpn_uninstalled "$VPN_IKEV2"
     print_success "IKEv2 uninstalled."
@@ -4954,6 +4995,9 @@ uninstall_l2tp() {
     fi
 
     fw_delete INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT 2>/dev/null || true
+    fw6_delete INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT 2>/dev/null || true
+    fw6_delete INPUT -p esp -j ACCEPT 2>/dev/null || true
+    fw6_delete INPUT -p ah -j ACCEPT 2>/dev/null || true
     save_iptables
     mark_vpn_uninstalled "$VPN_L2TP"
     print_success "L2TP uninstalled."
@@ -5529,6 +5573,12 @@ net.ipv6.conf.lo.disable_ipv6 = 1
 IPV6_SYSCTL
     sysctl -p "$sysctl_file" &>/dev/null || true
 
+    # Remove IPv6 from IKEv2 leftsubnet
+    if vpn_is_installed "$VPN_IKEV2" && [ -f /etc/ipsec.conf ]; then
+        sed -i 's|leftsubnet=0\.0\.0\.0/0,::/0|leftsubnet=0.0.0.0/0|' /etc/ipsec.conf
+        ipsec restart &>/dev/null || true
+    fi
+
     # Remove IPv6 from WireGuard config
     if vpn_is_installed "$VPN_WG" && [ -f /etc/wireguard/wg0.conf ]; then
         sed -i 's|Address = .*,.*|Address = '"${WG_SERVER_IP}/24"'|' /etc/wireguard/wg0.conf
@@ -5544,9 +5594,12 @@ IPV6_SYSCTL
         service_restart "$(get_openvpn_svc)"
     fi
 
-    # Flush ip6tables
+    # Flush ip6tables and set leak prevention policy
     ip6tables -F 2>/dev/null || true
     ip6tables -t nat -F 2>/dev/null || true
+    ip6tables -P FORWARD DROP 2>/dev/null || true
+    ip6tables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
     save_state "IPV6_ENABLED" "no"
     print_success "IPv6 disabled system-wide and removed from VPN configurations."
