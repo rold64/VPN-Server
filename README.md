@@ -664,6 +664,8 @@ Changing the server address (option 2) automatically regenerates WireGuard confi
 | `xl2tpd` not found (RHEL) | EPEL not enabled | Script installs EPEL automatically; check `dnf repolist` |
 | Uninstalling IKEv2 broke L2TP (or vice versa) | Old script removed shared `ipsec.conf`/`ipsec.secrets` when uninstalling one protocol | Fixed — uninstall now only removes protocol-specific entries; shared strongSwan files/packages are kept when the other protocol is still installed |
 | OpenVPN auth broken on RHEL: `Permission denied` on `users.passwd` | Auth directory owned by `root:nogroup` but RHEL uses `nobody` group | Fixed — script detects RHEL and uses `root:nobody` |
+| IKEv2 with Let's Encrypt: stuck connecting, no `AUTH_FAILED` error | Certbot 2.0+ defaults to ECDSA keys; `ipsec.secrets` declares `: RSA server.key` — strongSwan can't load an EC key as RSA | Fixed — script now passes `--key-type rsa` to certbot. For existing installs: `certbot certonly --standalone --key-type rsa --cert-name vpn-server -d <domain> --force-renewal`, then copy cert/key to `/etc/ipsec.d/` and `ipsec restart` |
+| strongSwan `unable to bind socket: Address already in use` (Ubuntu 24.04) | Two strongSwan services fighting over ports 500/4500: `strongswan.service` (swanctl) and `strongswan-starter.service` (ipsec.conf) | Fixed — script detects and uses the correct service; masks the swanctl-based service to prevent conflicts |
 
 </details>
 

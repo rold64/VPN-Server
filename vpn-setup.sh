@@ -628,6 +628,30 @@ service_is_active() {
 # Return the correct OpenVPN systemd service name for this OS.
 # Debian/Ubuntu and RHEL 7 use openvpn@server; RHEL 8+ uses openvpn-server@server.
 # Result is cached in _OPENVPN_SVC after first call and saved to state during install.
+# Return the correct strongSwan systemd service name for this OS.
+# Ubuntu 24.04+ has two services: strongswan.service (charon-systemd, uses swanctl)
+# and strongswan-starter.service (ipsec starter + charon, uses ipsec.conf).
+# This script uses ipsec.conf, so we need the starter-based service.
+# On older distros, strongswan.service IS the starter-based one.
+_STRONGSWAN_SVC=""
+get_strongswan_svc() {
+    if [ -n "$_STRONGSWAN_SVC" ]; then
+        printf '%s' "$_STRONGSWAN_SVC"
+        return
+    fi
+    # If strongswan-starter exists, that's the ipsec.conf-based service
+    if systemctl cat "strongswan-starter" &>/dev/null; then
+        _STRONGSWAN_SVC="strongswan-starter"
+        # Disable the swanctl-based service to prevent port conflicts
+        systemctl stop strongswan 2>/dev/null || true
+        systemctl disable strongswan 2>/dev/null || true
+        systemctl mask strongswan 2>/dev/null || true
+    else
+        _STRONGSWAN_SVC="strongswan"
+    fi
+    printf '%s' "$_STRONGSWAN_SVC"
+}
+
 _OPENVPN_SVC=""
 get_openvpn_svc() {
     if [ -n "$_OPENVPN_SVC" ]; then
@@ -1378,6 +1402,8 @@ obtain_letsencrypt_cert() {
         --standalone \
         --non-interactive \
         --agree-tos \
+        --key-type rsa \
+        --rsa-key-size 2048 \
         --email "$email" \
         -d "$domain" \
         --cert-name "vpn-server" \
@@ -1709,12 +1735,11 @@ install_ikev2() {
     configure_ikev2
     configure_ikev2_firewall
 
-    # Enable and start
-    service_enable "strongswan"
-    service_restart "strongswan"
-    # Some distros use strongswan-starter
-    service_enable "strongswan-starter" 2>/dev/null || true
-    service_restart "strongswan-starter" 2>/dev/null || true
+    # Enable and start the correct strongSwan service (starter-based for ipsec.conf)
+    local ss_svc
+    ss_svc=$(get_strongswan_svc)
+    service_enable "$ss_svc"
+    service_restart "$ss_svc"
 
     mark_vpn_installed "$VPN_IKEV2"
     print_success "IKEv2 installed and running."
@@ -1976,8 +2001,10 @@ install_l2tp() {
 
     service_enable "xl2tpd"
     service_restart "xl2tpd"
-    service_enable "strongswan"
-    service_restart "strongswan"
+    local ss_svc
+    ss_svc=$(get_strongswan_svc)
+    service_enable "$ss_svc"
+    service_restart "$ss_svc"
 
     mark_vpn_installed "$VPN_L2TP"
     print_success "L2TP/IPsec installed and running."
@@ -4570,7 +4597,7 @@ change_server_address_menu() {
         new_leftid=$([ "$new_type" = "dns" ] && echo "@${new_addr}" || echo "${new_addr}")
         escaped_leftid=$(sed_escape_replacement "$new_leftid")
         sed -i "s|leftid=.*|leftid=${escaped_leftid}|" /etc/ipsec.conf 2>/dev/null || true
-        service_restart "strongswan"
+        ipsec restart &>/dev/null || true
     fi
 
     # Restart OpenVPN
@@ -4695,7 +4722,7 @@ change_dns_menu() {
             [ -n "$SETUP_DNS2" ] && [ "$SETUP_DNS2" != "$SETUP_DNS1" ] && new_dns_val="${SETUP_DNS1},${SETUP_DNS2}"
             sed -i "s|rightdns=.*|rightdns=${new_dns_val}|" /etc/ipsec.conf
         fi
-        service_restart "strongswan"
+        ipsec restart &>/dev/null || true
     fi
 
     print_success "DNS resolvers updated. Services restarted."
@@ -4741,7 +4768,7 @@ update_vpn_menu() {
 
     # Restart services
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
-        service_restart "strongswan"
+        ipsec restart &>/dev/null || true
     fi
     if vpn_is_installed "$VPN_L2TP"; then
         service_restart "xl2tpd"
@@ -4840,8 +4867,9 @@ uninstall_ikev2() {
 
     # Only remove strongSwan entirely if L2TP isn't also installed (they share it)
     if ! vpn_is_installed "$VPN_L2TP"; then
-        service_stop "strongswan"
-        service_stop "strongswan-starter" 2>/dev/null || true
+        local ss_svc
+        ss_svc=$(get_strongswan_svc)
+        service_stop "$ss_svc"
         eval "$PKG_REMOVE strongswan libstrongswan-standard-plugins libcharon-extra-plugins" 2>/dev/null || true
         rm -f /etc/ipsec.conf /etc/ipsec.secrets
         rm -rf /etc/ipsec.d
@@ -4881,8 +4909,9 @@ uninstall_l2tp() {
 
     # Only remove strongSwan if IKEv2 isn't also installed
     if ! vpn_is_installed "$VPN_IKEV2"; then
-        service_stop "strongswan"
-        service_stop "strongswan-starter" 2>/dev/null || true
+        local ss_svc
+        ss_svc=$(get_strongswan_svc)
+        service_stop "$ss_svc"
         eval "$PKG_REMOVE strongswan" 2>/dev/null || true
         rm -f /etc/ipsec.conf /etc/ipsec.secrets
         rm -rf /etc/ipsec.d
@@ -5076,7 +5105,7 @@ apply_split_tunneling() {
             escaped_subnets=$(sed_escape_replacement "$ike_subnets")
             sed -i "s|leftsubnet=.*|leftsubnet=${escaped_subnets}|" /etc/ipsec.conf
         fi
-        service_restart "strongswan"
+        ipsec restart &>/dev/null || true
         print_success "IKEv2 split tunneling configured."
     fi
 
@@ -5533,14 +5562,18 @@ try_fix_service() {
     return 1
 }
 
-# Check if strongSwan is active (tries both service names)
+# Check if strongSwan is active (uses detected service name)
 strongswan_is_active() {
-    service_is_active "strongswan" || service_is_active "strongswan-starter"
+    local ss_svc
+    ss_svc=$(get_strongswan_svc)
+    service_is_active "$ss_svc"
 }
 
-# Restart strongSwan (tries both service names)
+# Restart strongSwan (uses detected service name)
 restart_strongswan() {
-    systemctl restart strongswan &>/dev/null || systemctl restart strongswan-starter &>/dev/null
+    local ss_svc
+    ss_svc=$(get_strongswan_svc)
+    systemctl restart "$ss_svc" &>/dev/null
     sleep 2
 }
 
@@ -6134,7 +6167,9 @@ print_final_summary() {
     echo -e "  ${BOLD}Service Status:${NC}"
     if vpn_is_installed "$VPN_IKEV2" || vpn_is_installed "$VPN_L2TP"; then
         local ss_status
-        ss_status=$(systemctl is-active strongswan 2>/dev/null) || ss_status=$(systemctl is-active strongswan-starter 2>/dev/null) || ss_status="unknown"
+        local ss_svc
+        ss_svc=$(get_strongswan_svc)
+        ss_status=$(systemctl is-active "$ss_svc" 2>/dev/null) || ss_status="unknown"
         echo -e "    strongSwan  : ${ss_status}"
     fi
     if vpn_is_installed "$VPN_L2TP"; then
