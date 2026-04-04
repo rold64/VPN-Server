@@ -1331,6 +1331,11 @@ setup_firewall_base() {
     # SSH (don't lock ourselves out)
     fw_add INPUT -p tcp --dport 22 -j ACCEPT
 
+    # Default policies: DROP for INPUT and FORWARD
+    # Must come AFTER essential accept rules (SSH, loopback, established) to avoid lockout
+    iptables -P INPUT DROP 2>/dev/null || true
+    iptables -P FORWARD DROP 2>/dev/null || true
+
     # Enable NAT/masquerading for all VPN subnets
     if ! iptables -t nat -C POSTROUTING -s "${IKEV2_SUBNET}" -o "${iface}" -j MASQUERADE &>/dev/null; then
         iptables -t nat -A POSTROUTING -s "${IKEV2_SUBNET}" -o "${iface}" -j MASQUERADE
@@ -1415,6 +1420,9 @@ obtain_letsencrypt_cert() {
     iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
     ip6tables -I INPUT 1 -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
 
+    # Ensure port 80 is closed even if script is interrupted
+    trap 'iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true; ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true' EXIT
+
     # shellcheck disable=SC2086
     certbot certonly \
         --standalone \
@@ -1431,6 +1439,7 @@ obtain_letsencrypt_cert() {
     # Close port 80
     iptables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
     ip6tables -D INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    trap - EXIT
 
     if [ $certbot_status -ne 0 ]; then
         print_error "certbot failed. Check /tmp/certbot_output.log for details."
@@ -2144,8 +2153,8 @@ conn L2TP-PSK
     authby=secret
     type=transport
     auto=add
-    ike=aes256-sha1-modp2048,aes128-sha1-modp1024,3des-sha1-modp1024
-    esp=aes256-sha1,aes128-sha1,3des-sha1
+    ike=aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes128-sha2_256-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024
+    esp=aes256-sha2_256,aes256-sha1,aes128-sha2_256,aes128-sha1,3des-sha1
 L2TP_CONN
 
     # Write PSK to ipsec.secrets (delete-before-add so the entry is always current)
@@ -2670,7 +2679,7 @@ fi
 
 exit 1
 VERIFY_SCRIPT
-    chmod 755 "${OPENVPN_DIR}/auth/verify.sh"
+    chmod 750 "${OPENVPN_DIR}/auth/verify.sh"
 
     print_success "OpenVPN auth script installed."
 }
@@ -4995,6 +5004,8 @@ uninstall_l2tp() {
     fi
 
     fw_delete INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT 2>/dev/null || true
+    fw_delete INPUT -p esp -j ACCEPT 2>/dev/null || true
+    fw_delete INPUT -p ah -j ACCEPT 2>/dev/null || true
     fw6_delete INPUT -p udp --dport "${L2TP_PORT}" -j ACCEPT 2>/dev/null || true
     fw6_delete INPUT -p esp -j ACCEPT 2>/dev/null || true
     fw6_delete INPUT -p ah -j ACCEPT 2>/dev/null || true
@@ -5442,12 +5453,17 @@ add_port_forward_rule() {
     local iface
     iface=$(get_primary_iface)
 
-    # DNAT: incoming on external port → client IP:internal port
-    iptables -t nat -A PREROUTING -i "$iface" -p "$proto" --dport "$ext_port" \
-        -j DNAT --to-destination "${client_ip}:${int_port}"
+    # DNAT: incoming on external port → client IP:internal port (skip if duplicate)
+    if ! iptables -t nat -C PREROUTING -i "$iface" -p "$proto" --dport "$ext_port" \
+        -j DNAT --to-destination "${client_ip}:${int_port}" 2>/dev/null; then
+        iptables -t nat -A PREROUTING -i "$iface" -p "$proto" --dport "$ext_port" \
+            -j DNAT --to-destination "${client_ip}:${int_port}"
+    fi
 
-    # FORWARD: allow forwarded traffic to client
-    iptables -A FORWARD -p "$proto" -d "$client_ip" --dport "$int_port" -j ACCEPT
+    # FORWARD: allow forwarded traffic to client (skip if duplicate)
+    if ! iptables -C FORWARD -p "$proto" -d "$client_ip" --dport "$int_port" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -p "$proto" -d "$client_ip" --dport "$int_port" -j ACCEPT
+    fi
 
     save_iptables
 

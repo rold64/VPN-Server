@@ -687,6 +687,10 @@ Changing the server address (option 2) automatically regenerates WireGuard confi
 - Passwords are **never stored in plaintext** for OpenVPN (SHA-256 hash only)
 - **IPv6 leak prevention** — when IPv6 is disabled, `ip6tables FORWARD DROP` policy blocks all IPv6 forwarding so traffic cannot leak around the tunnel on dual-stack networks
 - WireGuard and OpenVPN use **separate IPv6 subnets** (`fddd:...:2c4::/64` and `fddd:...:2c5::/64`) to prevent address collisions when both are installed
+- **Default DROP policies** — `iptables -P INPUT DROP` and `iptables -P FORWARD DROP` are set after allowing SSH, loopback, and established connections, so any traffic not explicitly permitted is blocked
+- **L2TP uses SHA2 ciphers** — IKE and ESP proposals include AES-256-SHA2_256 as the preferred option, with SHA1 and 3DES retained for legacy client compatibility
+- **Port forwarding deduplication** — `iptables -C` check prevents duplicate DNAT/FORWARD rules if the same port forwarding rule is added twice
+- **Port 80 cleanup on interrupt** — a trap ensures the temporary port 80 firewall rule opened for Let's Encrypt HTTP-01 challenges is removed even if the script is interrupted mid-certbot
 
 ### What you should do additionally
 
