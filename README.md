@@ -27,6 +27,7 @@ Run it again at any time to add users, change settings, or manage your VPN serve
 - 🔐 **Dual authentication** — IKEv2 and OpenVPN support both username/password *and* certificate authentication simultaneously
 - 📱 **Ready-to-import profiles** — generates `.mobileconfig` (Apple), `.sswan` (Android), `.ovpn` (OpenVPN), `.conf` (WireGuard), and `.ps1` (Windows) for every user
 - 🔄 **Re-run aware** — detects existing installations and presents a management menu instead of reinstalling
+- 🎛️ **Selection-aware** — installs only what you pick; prompts, certificates, profiles, and validation all adapt to the VPN types you selected
 - 🏗️ **Self-signed PKI** — auto-generates a full certificate authority with 10-year validity; no external CA needed
 - 🌍 **Let's Encrypt support** — when a DNS hostname is used, obtains a trusted LE certificate automatically via certbot HTTP-01; falls back to self-signed if LE fails; auto-renews via certbot's systemd timer/cron
 - 🩺 **Self-healing validation** — post-install health check verifies every service, port, interface, certificate, and firewall rule; automatically fixes what it can (service restarts, sysctl, iptables, PSK restore)
@@ -50,17 +51,19 @@ sudo bash vpn-setup.sh
 
 ### What happens next
 
-The script walks you through **7 setup questions**, then handles everything automatically:
+The script walks you through a short setup wizard, then handles everything automatically:
 
-| Step | Question |
-|------|----------|
-| 1 | Which VPN servers to install (IKEv2, L2TP, WireGuard, OpenVPN, or All) |
-| 2 | Server address: DNS hostname or auto-detected public IP |
-| 3 | Enable IPv6? (IPv4 is always on) |
-| 4 | Which DNS resolvers to push to clients (pick up to 2) |
-| 5 | First user's username |
-| 6 | First user's password |
-| 7 | Pre-shared key (used for IKEv2 PSK mode and L2TP/IPsec) |
+| Step | Question | Notes |
+|------|----------|-------|
+| 1 | Which VPN servers to install | Multi-select: enter `1 3` or `1,3,4` or `5` for all |
+| 2 | Server address: DNS hostname or auto-detected public IP | |
+| 3 | Enable IPv6? (IPv4 is always on) | |
+| 4 | Which DNS resolvers to push to clients (pick up to 2) | |
+| 5 | First user's username | |
+| 6 | First user's password | |
+| 7 | Pre-shared key | Only asked when IKEv2 or L2TP is selected |
+
+Only the selected VPN protocols are installed, configured, and validated. Certificates are only generated when a cert-based VPN (IKEv2 or OpenVPN) is selected. Profile files and connection info only include sections for the VPNs you installed.
 
 After answering, the script runs fully automatically — no further interaction needed until it's done.
 
@@ -127,7 +130,7 @@ User Management
   0) Back
 ```
 
-**Add a user** — prompts for username, password, and PSK → creates credentials across all installed VPNs and generates all profile files.
+**Add a user** — prompts for username and password, plus PSK if IKEv2 or L2TP is installed → creates credentials across all installed VPNs and generates profile files for each.
 
 **Add multiple users** — two modes:
 
@@ -142,6 +145,8 @@ CSV format for batch import:
 alice,SecurePass1!,SharedKey123
 bob,SecurePass2!,SharedKey456
 ```
+
+> The PSK column is only required when IKEv2 or L2TP is installed. If you're running only WireGuard and/or OpenVPN, `username,password` is sufficient.
 
 **Remove a user** — lists all users, prompts for confirmation, then removes credentials from all VPN configs and deletes the profile directory and certificates.
 
@@ -188,7 +193,7 @@ Updating a password regenerates the client certificate, P12 bundle, and all prof
 - IKEv2 and L2TP share strongSwan — uninstalling one preserves the shared config for the other
 
 **6 — Validate & fix VPN services**
-- Runs a comprehensive health check across all installed VPN services
+- Runs a comprehensive health check across installed VPN services (reads `INSTALLED_VPNS` from state — only validates what's actually installed)
 - Checks: service status, port listening, interface existence, ipsec connections loaded, certificate validity, iptables NAT rules, auth script permissions, IP forwarding
 - **Auto-fix**: when an issue is detected, the validator attempts automatic remediation before reporting an error:
   - Service not running → restart and re-check
@@ -330,21 +335,21 @@ The CA key never leaves the server. Distribute `ca.crt` (or the `.mobileconfig`/
 <summary><strong>📱 Client Profile Files</strong></summary>
 <br>
 
-For each user, profile files are generated in:
+Profile files are generated per user in `/etc/vpn-profiles/<username>/`. Only profiles for the installed VPN types are created:
 
 ```
 /etc/vpn-profiles/
 └── alice/
-    ├── alice_ikev2_eap.mobileconfig      ← Apple: IKEv2 username/password
-    ├── alice_ikev2_cert.mobileconfig     ← Apple: IKEv2 certificate auth
-    ├── alice_ikev2.sswan                 ← Android: strongSwan EAP (user/pass)
-    ├── alice_ikev2_cert.sswan            ← Android: strongSwan certificate
-    ├── alice_ikev2_windows.ps1           ← Windows: PowerShell setup script
-    ├── alice_wireguard.conf              ← WireGuard client config
-    ├── alice_openvpn.ovpn               ← OpenVPN config (certs embedded)
-    ├── alice_client_cert.p12            ← PKCS#12 certificate bundle
-    ├── alice_ca.crt                     ← CA certificate
-    └── alice_connection_info.txt        ← All credentials & manual setup guide
+    ├── alice_ikev2_eap.mobileconfig      ← Apple: IKEv2 username/password       (if IKEv2)
+    ├── alice_ikev2_cert.mobileconfig     ← Apple: IKEv2 certificate auth        (if IKEv2)
+    ├── alice_ikev2.sswan                 ← Android: strongSwan EAP (user/pass)  (if IKEv2)
+    ├── alice_ikev2_cert.sswan            ← Android: strongSwan certificate      (if IKEv2)
+    ├── alice_ikev2_windows.ps1           ← Windows: PowerShell setup script     (if IKEv2)
+    ├── alice_wireguard.conf              ← WireGuard client config              (if WireGuard)
+    ├── alice_openvpn.ovpn               ← OpenVPN config (certs embedded)       (if OpenVPN)
+    ├── alice_client_cert.p12            ← PKCS#12 certificate bundle            (if IKEv2 or OpenVPN)
+    ├── alice_ca.crt                     ← CA certificate                        (if IKEv2 or OpenVPN)
+    └── alice_connection_info.txt        ← Credentials & setup guide (installed VPNs only)
 ```
 
 ### Platform setup guides
