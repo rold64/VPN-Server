@@ -812,6 +812,36 @@ detect_os() {
     print_success "Detected OS: ${OS_ID} ${OS_VERSION} (Package manager: ${PKG_MANAGER})"
 }
 
+wait_for_apt_lock() {
+    is_debian_based || return 0
+
+    local attempts=60
+    local lock_paths="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+    local lock_taken=0
+
+    while [ $attempts -gt 0 ]; do
+        lock_taken=0
+        for lock_path in $lock_paths; do
+            if fuser "$lock_path" >/dev/null 2>&1; then
+                lock_taken=1
+                break
+            fi
+        done
+
+        [ $lock_taken -eq 0 ] && return 0
+
+        if [ $attempts -eq 60 ]; then
+            print_warning "Another apt/dpkg process is active. Waiting for the package lock..."
+        fi
+
+        sleep 2
+        attempts=$((attempts - 1))
+    done
+
+    print_error "Timed out waiting for apt/dpkg package locks to clear."
+    return 1
+}
+
 detect_arch() {
     local machine
     machine=$(uname -m)
@@ -3230,13 +3260,30 @@ remove_l2tp_user() {
 install_wg_packages() {
     print_step "Installing WireGuard packages..."
     if is_debian_based; then
-        DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL wireguard wireguard-tools" || {
-            # Try kernel module approach for older kernels
+        wait_for_apt_lock || exit 1
+
+        if DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL wireguard wireguard-tools"; then
+            return
+        fi
+
+        print_warning "Full WireGuard package install failed. Trying wireguard-tools only..."
+        wait_for_apt_lock || exit 1
+        if DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL wireguard-tools"; then
+            return
+        fi
+
+        if apt-cache show wireguard-dkms >/dev/null 2>&1; then
+            print_warning "wireguard-tools alone failed. Trying wireguard-dkms fallback..."
+            wait_for_apt_lock || exit 1
             DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL wireguard-dkms wireguard-tools" || {
                 print_error "Failed to install WireGuard."
                 exit 1
             }
-        }
+            return
+        fi
+
+        print_error "Failed to install WireGuard. 'wireguard' and 'wireguard-tools' failed, and 'wireguard-dkms' is not available on this system."
+        exit 1
     elif is_rhel_based; then
         install_epel
         eval "$PKG_INSTALL wireguard-tools" || {
