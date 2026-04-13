@@ -2692,15 +2692,15 @@ install_ikev2_packages() {
     if is_debian_based; then
         DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL \
             strongswan \
+            strongswan-starter \
             strongswan-pki \
             libstrongswan-standard-plugins \
             libstrongswan-extra-plugins \
             libcharon-extra-plugins \
-            libcharon-extauth-plugins" || true
-        # Try newer package names
-        DEBIAN_FRONTEND=noninteractive eval "$PKG_INSTALL \
-            strongswan-swanctl \
-            charon-systemd" 2>/dev/null || true
+            libcharon-extauth-plugins" || {
+            print_error "Failed to install strongSwan packages."
+            exit 1
+        }
     elif is_rhel_based; then
         # Older RHEL-family releases split EAP-MSCHAPv2 into a separate plugin
         # package, while newer releases such as CentOS Stream 10 bundle it into
