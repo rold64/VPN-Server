@@ -3559,6 +3559,10 @@ configure_openvpn() {
     dns1=$(get_state "DNS1")
     local dns2
     dns2=$(get_state "DNS2")
+    local dns1_v6
+    dns1_v6=$(get_state "DNS1_IPV6")
+    local dns2_v6
+    dns2_v6=$(get_state "DNS2_IPV6")
     local ipv6_enabled
     ipv6_enabled=$(get_state "IPV6_ENABLED")
 
@@ -3571,6 +3575,16 @@ configure_openvpn() {
     if [ -n "$dns2" ] && [ "$dns2" != "$dns1" ]; then
         push_dns="${push_dns}
 push \"dhcp-option DNS ${dns2}\""
+    fi
+    if [ "$ipv6_enabled" = "yes" ]; then
+        if [ -n "$dns1_v6" ]; then
+            push_dns="${push_dns}
+push \"dhcp-option DNS ${dns1_v6}\""
+        fi
+        if [ -n "$dns2_v6" ] && [ "$dns2_v6" != "$dns1_v6" ]; then
+            push_dns="${push_dns}
+push \"dhcp-option DNS ${dns2_v6}\""
+        fi
     fi
 
     # OpenVPN 'server' directive needs plain network address without CIDR prefix
@@ -6027,6 +6041,14 @@ change_dns_menu() {
         fi
         if [ -n "$SETUP_DNS2" ] && [ "$SETUP_DNS2" != "$SETUP_DNS1" ]; then
             echo "push \"dhcp-option DNS ${SETUP_DNS2}\"" >> "${ovpn_conf}"
+        fi
+        if [ "$SETUP_IPV6" = "yes" ]; then
+            if [ -n "$SETUP_DNS1_V6" ]; then
+                echo "push \"dhcp-option DNS ${SETUP_DNS1_V6}\"" >> "${ovpn_conf}"
+            fi
+            if [ -n "$SETUP_DNS2_V6" ] && [ "$SETUP_DNS2_V6" != "$SETUP_DNS1_V6" ]; then
+                echo "push \"dhcp-option DNS ${SETUP_DNS2_V6}\"" >> "${ovpn_conf}"
+            fi
         fi
         service_restart "$(get_openvpn_svc)"
     fi

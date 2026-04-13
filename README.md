@@ -306,6 +306,8 @@ Passwords are stored as **SHA-256 hashes** in `/etc/openvpn/auth/users.passwd`. 
 
 Per-user client configuration files (CCD) assign a fixed IP to each user.
 
+When IPv6 is enabled, OpenVPN pushes the selected IPv6 DNS resolvers after the IPv4 DNS entries, matching the dual-stack behavior of the other protocols.
+
 </details>
 
 ---
